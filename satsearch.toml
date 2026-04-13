@@ -1,0 +1,20 @@
+# Copy to ``satsearch.toml`` in this directory (or set SATSEARCH_CONFIG to a TOML path).
+# Paths are examples — point SPICE meta-kernels (.tm), refcat, and the default FITS folder at your site.
+
+[spice]
+# NAIF/CSPICE meta-kernel(s) to load with furnsh (order matters; leapseconds usually included).
+meta_kernels = [
+    "/home/mbrown/lucy/kernels/mk/lcy.donj.science.LATEST.tm",
+]
+# Names must match loaded SPICE kernels (see kernel comments for NAIF IDs).
+target_body = "DONALDJOHANSON"
+observer_body = "LUCY"
+sun_body = "SUN"
+frame = "J2000"
+abcorr = "NONE"
+
+[paths]
+refcat_exe = "/net/eris/data1/catalogs/atlas-refcat/refcat"
+refcat_dir = "/net/eris/data1/catalogs/atlas-refcat/00_m_16"
+# Initial directory for the FITS thumbnail browser (Browse… can change it).
+default_fits_directory = "/home/mbrown/lucy/dj/satsearch/../llori/2025110"

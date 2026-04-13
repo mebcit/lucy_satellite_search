@@ -1,0 +1,6 @@
+astropy>=6.0
+numpy>=1.24
+photutils>=1.10
+Pillow>=10.0
+scipy>=1.10
+spiceypy>=5.0
