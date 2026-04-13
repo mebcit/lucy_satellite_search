@@ -102,11 +102,27 @@ def wcs_from_path(path: Path) -> WCS:
         return WCS(hdul[0].header, naxis=2, relax=True)
 
 
-def range_phase_delta_km(path: Path) -> tuple[float, float, float]:
-    """Lucy–target range (km), phase angle (deg), Sun–target distance (km).
+def _lucy_observer_pos_km(path: Path) -> np.ndarray:
+    """Target position (km) relative to Lucy only; one ET + one ``spkpos``."""
+    _ensure_spiceypy()
+    import spiceypy as spice
 
-    Matches IDL ``getgeometry.pro``, including ``phase = acos(pos·spos)/(range*delta))`` in degrees.
-    """
+    cfg = get_config()
+    et = et_from_midutcjd(path)
+    with _lock:
+        _furnsh_once()
+        pos, _lt = spice.spkpos(
+            cfg.spice.target_body,
+            et,
+            cfg.spice.frame,
+            cfg.spice.abcorr,
+            cfg.spice.observer_body,
+        )
+    return np.asarray(pos, dtype=np.float64).ravel()
+
+
+def _lucy_sun_pos_km(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Target position (km) from Lucy and from Sun; one ET + two ``spkpos`` under the same lock."""
     _ensure_spiceypy()
     import spiceypy as spice
 
@@ -130,47 +146,17 @@ def range_phase_delta_km(path: Path) -> tuple[float, float, float]:
         )
     pos = np.asarray(pos, dtype=np.float64).ravel()
     spos = np.asarray(spos, dtype=np.float64).ravel()
-    range_km = float(np.sqrt(np.sum(pos * pos)))
-    delta_km = float(np.sqrt(np.sum(spos * spos)))
-    if range_km <= 0 or delta_km <= 0:
-        raise ValueError(f"SPICE returned non-positive range for {path.name}")
-    ph_rad = float(np.dot(pos, spos) / (range_km * delta_km))
-    ph_rad = max(-1.0, min(1.0, ph_rad))
-    phase_deg = math.degrees(math.acos(ph_rad))
-    return range_km, phase_deg, delta_km
+    return pos, spos
 
 
-def predicted_target_pixel_xy(path: Path) -> tuple[float, float]:
-    """Predicted target (x, y) native pixels from SPICE + WCS (IDL ``lucy_finddj`` + ``ad2xy``).
-
-    ``spkpos`` returns J2000 (x,y,z) km. Standard equatorial uses
-    ``RA = atan2(y, x)``, ``Dec = asin(z/r)``. IDL used ``atan2(pos[0], pos[1])`` (i.e. ``atan2(x,y)``),
-    which is not the usual J2000 convention and can put the target far off-axis so
-    ``WCS.all_world2pix`` inverse iteration diverges. We use ``atan2(y,x)``, then map with
-    :class:`~astropy.coordinates.SkyCoord` (FK5 J2000 → ICRS) and :meth:`~astropy.wcs.WCS.world_to_pixel`
-    for stable distortion handling.
-    """
-    _ensure_spiceypy()
-    import spiceypy as spice
-
-    cfg = get_config()
-    et = et_from_midutcjd(path)
-    with _lock:
-        _furnsh_once()
-        pos, _lt = spice.spkpos(
-            cfg.spice.target_body,
-            et,
-            cfg.spice.frame,
-            cfg.spice.abcorr,
-            cfg.spice.observer_body,
-        )
+def _predicted_pixels_from_lucy_pos(path: Path, pos: np.ndarray) -> tuple[float, float]:
+    """Map J2000 Lucy→target vector (km) to pixel (x, y) using WCS."""
     pos = np.asarray(pos, dtype=np.float64).ravel()
     r = float(np.sqrt(np.sum(pos * pos)))
     if r <= 0:
         raise ValueError(f"SPICE returned zero range for {path.name}")
-    # J2000 Cartesian (NAIF): RA = atan2(y, x), Dec = asin(z/r)
-    ux, uy, uz = float(pos[0] / r), float(pos[1] / r), float(pos[2] / r)
-    uz = max(-1.0, min(1.0, uz))
+    uy, ux = float(pos[1] / r), float(pos[0] / r)
+    uz = max(-1.0, min(1.0, float(pos[2] / r)))
     ra_rad = math.atan2(uy, ux)
     dec_rad = math.asin(uz)
     ra_deg = math.degrees(ra_rad) % 360.0
@@ -189,7 +175,6 @@ def predicted_target_pixel_xy(path: Path) -> tuple[float, float]:
     except Exception:
         pass
 
-    # Fallback: iterative inverse with relaxed settings (some TAN-SIP setups need this)
     ra_icrs = float(sky_icrs.ra.deg)
     dec_icrs = float(sky_icrs.dec.deg)
     out = wcs.all_world2pix(
@@ -208,6 +193,49 @@ def predicted_target_pixel_xy(path: Path) -> tuple[float, float]:
             f"(ICRS ra={ra_icrs:.5f}°, dec={dec_icrs:.5f}°). Check astrometry in the FITS header."
         )
     return float(px2), float(py2)
+
+
+def range_phase_delta_km(path: Path) -> tuple[float, float, float]:
+    """Lucy–target range (km), phase angle (deg), Sun–target distance (km).
+
+    Matches IDL ``getgeometry.pro``, including ``phase = acos(pos·spos)/(range*delta))`` in degrees.
+    """
+    pos, spos = _lucy_sun_pos_km(path)
+    range_km = float(np.sqrt(np.sum(pos * pos)))
+    delta_km = float(np.sqrt(np.sum(spos * spos)))
+    if range_km <= 0 or delta_km <= 0:
+        raise ValueError(f"SPICE returned non-positive range for {path.name}")
+    ph_rad = float(np.dot(pos, spos) / (range_km * delta_km))
+    ph_rad = max(-1.0, min(1.0, ph_rad))
+    phase_deg = math.degrees(math.acos(ph_rad))
+    return range_km, phase_deg, delta_km
+
+
+def stars_ephemeris_bundle(path: Path) -> tuple[float, float, float, float, float]:
+    """Single SPICE pass for Stars: geometry + predicted pixels (avoids duplicate ``et``/``spkpos``).
+
+    Returns ``(range_km, phase_deg, delta_km, xpred, ypred)``.
+    """
+    pos, spos = _lucy_sun_pos_km(path)
+    range_km = float(np.sqrt(np.sum(pos * pos)))
+    delta_km = float(np.sqrt(np.sum(spos * spos)))
+    if range_km <= 0 or delta_km <= 0:
+        raise ValueError(f"SPICE returned non-positive range for {path.name}")
+    ph_rad = float(np.dot(pos, spos) / (range_km * delta_km))
+    ph_rad = max(-1.0, min(1.0, ph_rad))
+    phase_deg = math.degrees(math.acos(ph_rad))
+    xpred, ypred = _predicted_pixels_from_lucy_pos(path, pos)
+    return range_km, phase_deg, delta_km, xpred, ypred
+
+
+def predicted_target_pixel_xy(path: Path) -> tuple[float, float]:
+    """Predicted target (x, y) native pixels from SPICE + WCS (IDL ``lucy_finddj`` + ``ad2xy``).
+
+    Uses one Lucy ``spkpos`` only. For Stars analysis, prefer :func:`stars_ephemeris_bundle` to avoid
+    duplicating geometry work.
+    """
+    pos = _lucy_observer_pos_km(path)
+    return _predicted_pixels_from_lucy_pos(path, pos)
 
 
 def range_km_for_display(path: Path) -> float | None:

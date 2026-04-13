@@ -87,6 +87,52 @@ def fakesat_flux(
     return float(10.0 ** (-(v_mag - ZPT) / 2.5))
 
 
+def diameter_for_fakesat_total_counts(
+    total_counts: float,
+    albedo: float,
+    range_km: float,
+    delta_km: float,
+    phase_deg: float,
+    exptime_s: float,
+) -> float | None:
+    """Invert :func:`fakesat_flux` × exposure time to a sphere diameter (meters).
+
+    ``total_counts`` is the modeled **integrated** source counts in one exposure (same units as
+    ``fakesat_flux(...) * exptime`` in stack/stars fake injection). Uses bisection on diameter
+    between ``1e-6`` m and ``1e8`` m; returns ``None`` if inputs are non-finite or non-positive.
+    """
+    if (
+        not math.isfinite(total_counts)
+        or total_counts <= 0
+        or not math.isfinite(exptime_s)
+        or exptime_s <= 0
+    ):
+        return None
+    target_rate = float(total_counts) / float(exptime_s)
+    if not math.isfinite(target_rate) or target_rate <= 0:
+        return None
+
+    lo_d, hi_d = 1e-6, 1e8
+    f_lo = fakesat_flux(lo_d, albedo, range_km, delta_km, phase_deg)
+    f_hi = fakesat_flux(hi_d, albedo, range_km, delta_km, phase_deg)
+    if target_rate <= f_lo:
+        return lo_d
+    if target_rate >= f_hi:
+        return hi_d
+
+    lo, hi = lo_d, hi_d
+    for _ in range(96):
+        mid = 0.5 * (lo + hi)
+        fm = fakesat_flux(mid, albedo, range_km, delta_km, phase_deg)
+        if fm < target_rate:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < max(lo, 1e-30) * 1e-10:
+            break
+    return float(0.5 * (lo + hi))
+
+
 def sky_subtract_median(im: np.ndarray) -> tuple[np.ndarray, float]:
     m = float(np.nanmedian(im))
     return im - m, m

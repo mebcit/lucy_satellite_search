@@ -44,6 +44,8 @@ DEFAULT_ARCSEC_PER_PIXEL = 1.0
 LEGACY_THUMB_GLOB = "*_thumb.png"
 THUMB_MAX = 160
 FULL_HILL_SIZE = 1024
+# Local sky statistics on left-click (Stars / Stack): median, RMS from median, 5σ limits.
+SKY_REPORT_BOX = 30
 COLS = 4
 WORKERS = 2
 # Fixed row height for virtual scrolling (avoids one X pixmap per file — BadAlloc).
@@ -56,6 +58,95 @@ GROUP_ACCENT_COLORS = ("#1d4ed8", "#047857", "#b45309", "#b91c1c", "#6d28d9", "#
 MAX_VIEWPORT_PX = 4096
 # Hard cap on rows materialized per sync (guards bogus canvas geometry before map).
 MAX_ROWS_PER_SYNC = 10
+
+
+def _clipped_square_box(
+    nr: float, nc: float, h: int, w: int, box: int = SKY_REPORT_BOX
+) -> tuple[int, int, int, int]:
+    """``r0, r1, c0, c1`` for a ``box``×``box`` region centered at ``(nr, nc)``, clipped to the image."""
+    if h < 1 or w < 1:
+        return 0, 0, 0, 0
+    box = int(box)
+    bh = min(box, h)
+    bw = min(box, w)
+    half_r = bh // 2
+    half_c = bw // 2
+    ir = int(round(nr))
+    ic = int(round(nc))
+    r0 = max(0, min(ir - half_r, h - bh))
+    c0 = max(0, min(ic - half_c, w - bw))
+    return r0, r0 + bh, c0, c0 + bw
+
+
+def _patch_median_rms_npix(patch: np.ndarray) -> tuple[float, float, int]:
+    p = np.asarray(patch, dtype=np.float64).ravel()
+    p = p[np.isfinite(p)]
+    n = int(p.size)
+    if n == 0:
+        return float("nan"), float("nan"), 0
+    med = float(np.median(p))
+    rms = float(np.sqrt(np.mean((p - med) ** 2)))
+    return med, rms, n
+
+
+def sky_box_five_sigma_integrated(rms: float, n_pix: int) -> float:
+    """Background-limited total counts at 5σ in an aperture of ``n_pix`` independent pixels."""
+    if n_pix <= 0 or not math.isfinite(rms):
+        return float("nan")
+    return float(5.0 * float(rms) * math.sqrt(float(n_pix)))
+
+
+def format_sky_box_report(
+    med: float,
+    rms: float,
+    five_pix: float,
+    flux_5: float,
+    n_pix: int,
+    r0: int,
+    r1: int,
+    c0: int,
+    c1: int,
+    diam_line: str | None,
+    *,
+    title_note: str = "",
+    error: str | None = None,
+) -> str:
+    """Multi-line text for the Stars / Stack 30×30 sky-box dialog."""
+    head = "30×30 sky box"
+    if title_note:
+        head += f" ({title_note})"
+    lines = [
+        head,
+        f"Box rows [{r0}:{r1}), cols [{c0}:{c1})  ({n_pix} px)",
+        f"median (sky) = {med:.8g}",
+        f"RMS from median = {rms:.8g}",
+        f"5×RMS (per-pixel) = {five_pix:.8g}",
+        f"5σ integrated limit = {flux_5:.8g} counts (5·RMS·√N, i.i.d. pixel noise)",
+        "",
+        "Equivalent sphere diameter (fakesat model, albedo from window):",
+    ]
+    if error:
+        lines.append(f"  —  ({error})")
+    elif diam_line:
+        lines.append(f"  {diam_line}")
+    else:
+        lines.append("  —")
+    lines.extend(
+        [
+            "",
+            "Diameter inverts fakesat_flux(D)×EXPTIME to match that integrated limit; treat as",
+            "order-of-magnitude (local box vs PSF-integrated point source).",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _display_to_native_xy(
+    ix: int, iy: int, iw: int, ih: int, nw: int, nh: int
+) -> tuple[float, float]:
+    fx = ix * (nw - 1) / max(iw - 1, 1)
+    fy = iy * (nh - 1) / max(ih - 1, 1)
+    return float(fx), float(fy)
 
 
 def default_root_dir() -> Path:
@@ -716,6 +807,7 @@ class FullHillWindow(tk.Toplevel):
         self._img_label.pack()
         self._img_label.bind("<Motion>", self._on_probe_motion)
         self._img_label.bind("<Leave>", self._on_probe_leave)
+        self._img_label.bind("<Button-1>", self._on_stack_sky_box_click)
 
         self.after_idle(self._run_pipeline)
 
@@ -729,6 +821,74 @@ class FullHillWindow(tk.Toplevel):
         self._play_active = False
         if self._play_btn.winfo_exists():
             self._play_btn.configure(text="Play")
+
+    def _on_stack_sky_box_click(self, event: object) -> None:
+        """Left-click: 30×30 local median / RMS, 5σ, equivalent fakesat diameter (this plane)."""
+        if self._busy:
+            return
+        if self._result is None or self._photo is None or self._fullhill_prep is None:
+            return
+        xy = self._probe_image_xy(event)
+        if xy is None:
+            return
+        ix, iy = xy
+        try:
+            alb = self._parse_float(self._alb_var, "albedo")
+        except ValueError:
+            messagebox.showerror("Stack", "Invalid albedo.")
+            return
+
+        from fullhill import diameter_for_fakesat_total_counts
+
+        name = self._stack_var.get()
+        cube = getattr(self._result, name, None)
+        if cube is None:
+            return
+        prep = self._fullhill_prep
+        n_pl = int(prep.rr.shape[0])
+        if cube.ndim == 2:
+            plane = np.asarray(cube, dtype=np.float64)
+            k_geo = n_pl - 1
+        else:
+            k_geo = int(round(float(self._idx_var.get())))
+            k_geo = max(0, min(k_geo, cube.shape[2] - 1))
+            plane = np.asarray(cube[:, :, k_geo], dtype=np.float64)
+
+        h, w = int(plane.shape[0]), int(plane.shape[1])
+        iw = self._photo.width()
+        ih = self._photo.height()
+        nc, nr = _display_to_native_xy(ix, iy, iw, ih, w, h)
+        r0, r1, c0, c1 = _clipped_square_box(nr, nc, h, w, SKY_REPORT_BOX)
+        patch = plane[r0:r1, c0:c1]
+        med, rms, n_pix = _patch_median_rms_npix(patch)
+        five_pix = 5.0 * rms if np.isfinite(rms) else float("nan")
+        flux_5 = sky_box_five_sigma_integrated(rms, n_pix)
+
+        path_m = self._selected_paths[k_geo]
+        et = primary_exptime_seconds(path_m)
+        et_s = float(et) if et is not None and et > 0 else 1.0
+        rr = float(prep.rr[k_geo])
+        ph = float(prep.ph_deg[k_geo])
+        dk = float(prep.delta_km[k_geo])
+
+        diam = diameter_for_fakesat_total_counts(flux_5, alb, rr, dk, ph, et_s)
+        d_s = f"{diam:.4g} m" if diam is not None and math.isfinite(diam) else "—"
+        messagebox.showinfo(
+            "Stack",
+            format_sky_box_report(
+                med,
+                rms,
+                five_pix,
+                flux_5,
+                n_pix,
+                r0,
+                r1,
+                c0,
+                c1,
+                d_s,
+                title_note="Stack",
+            ),
+        )
 
     def _toggle_play(self) -> None:
         if self._play_active:
@@ -1043,8 +1203,10 @@ class StarsWindow(tk.Toplevel):
         super().__init__(master)
         self.title("Stars")
         self._paths = list(selected_paths)
+        n = len(self._paths)
         self._quit_root_when_destroyed = quit_root_when_destroyed
-        self._root = master
+        # Not named ``_root``: that shadows ``Misc._root()`` and breaks Tk event dispatch.
+        self._master_ref = master
         # If the root is withdrawn, ``transient`` can prevent the window from mapping (Linux WMs).
         try:
             if int(master.winfo_viewable()) != 0:
@@ -1056,14 +1218,13 @@ class StarsWindow(tk.Toplevel):
         self._cache_fill_gen = 0
         self._plane_cache: list[object | None] = []
         self._tk_photos: list[ImageTk.PhotoImage | None] = []
-        self._astro_shift: tuple[float, float] = (0.0, 0.0)
         self._align_step: str | None = None
         self._align_pred_native: tuple[float, float] | None = None
         self._define_center_waiting = False
-        self._global_target_center: tuple[float, float] | None = None
-        self._last_define_center_plane: int | None = None
-        self._per_plane_center_mode = False
-        self._plane_target_center: list[tuple[float, float] | None] | None = None
+        # Per-plane: user-marked target (native px); None → centroid for that plane in the pipeline.
+        self._plane_target_center: list[tuple[float, float] | None] = [None] * n
+        # Per-plane manual refcat tweak after **Align** (additive to djx−xpred term).
+        self._plane_astro_shift: list[tuple[float, float]] = [(0.0, 0.0) for _ in range(n)]
 
         self.geometry("1100x1000")
         self.minsize(640, 480)
@@ -1072,24 +1233,38 @@ class StarsWindow(tk.Toplevel):
         top.pack(fill=tk.X)
         ttk.Button(top, text="Close", command=self.destroy).pack(side=tk.RIGHT)
 
-        n = len(self._paths)
         ctrl = ttk.Frame(self, padding=(8, 0))
         ctrl.pack(fill=tk.X)
         ttk.Label(ctrl, text="Max r mag:").pack(side=tk.LEFT)
         self._mag_max_var = tk.StringVar(value="15")
         ttk.Entry(ctrl, textvariable=self._mag_max_var, width=6).pack(side=tk.LEFT, padx=(4, 16))
-        ttk.Label(ctrl, text="diam (m):").pack(side=tk.LEFT)
+        _lbl_d = ttk.Label(ctrl, text="diam (m):")
+        _lbl_d.pack(side=tk.LEFT)
         self._diam_var = tk.StringVar(value="2.5")
-        ttk.Entry(ctrl, textvariable=self._diam_var, width=6).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(ctrl, text="albedo:").pack(side=tk.LEFT)
+        self._diam_entry = ttk.Entry(ctrl, textvariable=self._diam_var, width=6)
+        self._diam_entry.pack(side=tk.LEFT, padx=(4, 8))
+        _lbl_a = ttk.Label(ctrl, text="albedo:")
+        _lbl_a.pack(side=tk.LEFT)
         self._alb_var = tk.StringVar(value="0.41")
-        ttk.Entry(ctrl, textvariable=self._alb_var, width=6).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(ctrl, text="sat dist (km):").pack(side=tk.LEFT)
+        self._alb_entry = ttk.Entry(ctrl, textvariable=self._alb_var, width=6)
+        self._alb_entry.pack(side=tk.LEFT, padx=(4, 8))
+        _lbl_sd = ttk.Label(ctrl, text="sat dist (km):")
+        _lbl_sd.pack(side=tk.LEFT)
         self._satdist_var = tk.StringVar(value="200")
-        ttk.Entry(ctrl, textvariable=self._satdist_var, width=8).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(ctrl, text="sat ang (deg):").pack(side=tk.LEFT)
+        self._satdist_entry = ttk.Entry(ctrl, textvariable=self._satdist_var, width=8)
+        self._satdist_entry.pack(side=tk.LEFT, padx=(4, 8))
+        _lbl_sa = ttk.Label(ctrl, text="sat ang (deg):")
+        _lbl_sa.pack(side=tk.LEFT)
         self._satang_var = tk.StringVar(value="0")
-        ttk.Entry(ctrl, textvariable=self._satang_var, width=6).pack(side=tk.LEFT, padx=(4, 8))
+        self._satang_entry = ttk.Entry(ctrl, textvariable=self._satang_var, width=6)
+        self._satang_entry.pack(side=tk.LEFT, padx=(4, 8))
+        self._fake_sat_entries = (
+            self._diam_entry,
+            self._alb_entry,
+            self._satdist_entry,
+            self._satang_entry,
+        )
+        self._fake_sat_labels = (_lbl_d, _lbl_a, _lbl_sd, _lbl_sa)
         ttk.Button(ctrl, text="Refresh", command=self._reload_current).pack(side=tk.LEFT, padx=(12, 0))
         self._align_btn = ttk.Button(ctrl, text="Align", command=self._start_align)
         self._align_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -1158,8 +1333,12 @@ class StarsWindow(tk.Toplevel):
         self._img_label.pack()
         self._img_label.bind("<Motion>", self._on_probe_motion)
         self._img_label.bind("<Leave>", self._on_probe_leave)
+        self._img_label.bind("<Button-1>", self._on_stars_image_b1)
 
         self.bind("<Escape>", self._on_escape_stars)
+        self.bind("<FocusIn>", lambda _e: self._sync_fake_sat_controls_state())
+        self.bind("<Map>", lambda _e: self._sync_fake_sat_controls_state())
+        self.after_idle(self._sync_fake_sat_controls_state)
         self.after_idle(self._reload_current)
 
     def destroy(self) -> None:
@@ -1174,25 +1353,107 @@ class StarsWindow(tk.Toplevel):
         super().destroy()
         if self._quit_root_when_destroyed:
             try:
-                self._root.destroy()
+                self._master_ref.destroy()
             except tk.TclError:
                 pass
 
     def _target_center_for_plane(self, k: int) -> tuple[float, float] | None:
-        """Native (x, y) target center for refcat alignment; ``None`` → use brightness centroid."""
-        if self._global_target_center is None:
-            return None
-        if not self._per_plane_center_mode:
-            return self._global_target_center
+        """Native (x, y) target center for this plane; ``None`` → use brightness centroid."""
         o = self._plane_target_center
         if o is None or k < 0 or k >= len(o):
-            return self._global_target_center
-        c = o[k]
-        return c if c is not None else self._global_target_center
+            return None
+        return o[k]
 
     def _on_escape_stars(self, event: object | None = None) -> None:
         self._cancel_define_center()
         self._cancel_align()
+
+    def _on_stars_image_b1(self, event: object) -> None:
+        if self._define_center_waiting:
+            self._on_define_center_b1(event)
+            return
+        if self._align_step is not None:
+            self._on_align_b1(event)
+            return
+        self._on_sky_box_report_stars(event)
+
+    def _on_sky_box_report_stars(self, event: object) -> None:
+        """Left-click (idle): 30×30 local median / RMS, 5σ, equivalent fakesat diameter."""
+        if self._native_data is None or self._photo is None:
+            return
+        xy = self._probe_image_xy(event)
+        if xy is None:
+            return
+        try:
+            alb = float(self._alb_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Stars", "Invalid albedo.")
+            return
+        from fullhill import diameter_for_fakesat_total_counts
+        from lucy_spice import stars_ephemeris_bundle
+
+        ix, iy = xy
+        plane = np.asarray(self._native_data, dtype=np.float64)
+        h, w = int(plane.shape[0]), int(plane.shape[1])
+        iw = self._photo.width()
+        ih = self._photo.height()
+        nc, nr = _display_to_native_xy(ix, iy, iw, ih, w, h)
+        r0, r1, c0, c1 = _clipped_square_box(nr, nc, h, w, SKY_REPORT_BOX)
+        patch = plane[r0:r1, c0:c1]
+        med, rms, n_pix = _patch_median_rms_npix(patch)
+        five_pix = 5.0 * rms if np.isfinite(rms) else float("nan")
+        flux_5 = sky_box_five_sigma_integrated(rms, n_pix)
+
+        try:
+            k = int(round(float(self._idx_var.get())))
+        except (ValueError, tk.TclError):
+            k = 0
+        k = max(0, min(k, len(self._paths) - 1))
+        path = self._paths[k]
+        try:
+            range_km, phase_deg, delta_km, _xp, _yp = stars_ephemeris_bundle(path)
+        except Exception as e:
+            messagebox.showinfo(
+                "Stars",
+                format_sky_box_report(
+                    med,
+                    rms,
+                    five_pix,
+                    flux_5,
+                    n_pix,
+                    r0,
+                    r1,
+                    c0,
+                    c1,
+                    None,
+                    title_note="Stars",
+                    error=str(e),
+                ),
+            )
+            return
+
+        et = primary_exptime_seconds(path)
+        et_s = float(et) if et is not None and et > 0 else 1.0
+        diam = diameter_for_fakesat_total_counts(
+            flux_5, alb, range_km, delta_km, phase_deg, et_s
+        )
+        d_s = f"{diam:.4g} m" if diam is not None and math.isfinite(diam) else "—"
+        messagebox.showinfo(
+            "Stars",
+            format_sky_box_report(
+                med,
+                rms,
+                five_pix,
+                flux_5,
+                n_pix,
+                r0,
+                r1,
+                c0,
+                c1,
+                d_s,
+                title_note="Stars",
+            ),
+        )
 
     def _start_define_center(self) -> None:
         if self._define_center_waiting:
@@ -1201,20 +1462,15 @@ class StarsWindow(tk.Toplevel):
         self._stop_play()
         self._cancel_align()
         self._define_center_waiting = True
-        self._img_label.bind("<Button-1>", self._on_define_center_b1)
         self._status.configure(
-            text="Define center: click the target center on this image — Esc cancels. "
-            "(First click sets all planes; defining again on another plane uses per-plane centers.)",
+            text="Define center: click the target on **this plane** only — sets target position and "
+            "astrometry vs ephemeris for this plane, then redraws. Esc cancels.",
         )
 
     def _cancel_define_center(self, _event: object | None = None) -> None:
         if not self._define_center_waiting:
             return
         self._define_center_waiting = False
-        try:
-            self._img_label.unbind("<Button-1>")
-        except tk.TclError:
-            pass
         try:
             k = int(round(float(self._idx_var.get())))
         except (ValueError, tk.TclError):
@@ -1239,31 +1495,37 @@ class StarsWindow(tk.Toplevel):
         n = len(self._paths)
         k = max(0, min(k, n - 1))
 
-        if not self._per_plane_center_mode:
-            if self._last_define_center_plane is None:
-                self._global_target_center = (nx, ny)
-                self._last_define_center_plane = k
-            elif k == self._last_define_center_plane:
-                self._global_target_center = (nx, ny)
-            else:
-                self._per_plane_center_mode = True
-                self._plane_target_center = [None] * n
-                self._plane_target_center[k] = (nx, ny)
-                self._last_define_center_plane = k
-        else:
-            if self._plane_target_center is None:
-                self._plane_target_center = [None] * n
-            self._plane_target_center[k] = (nx, ny)
-            self._last_define_center_plane = k
+        if self._plane_target_center is None or len(self._plane_target_center) != n:
+            self._plane_target_center = [None] * n
+        if len(self._plane_astro_shift) != n:
+            self._plane_astro_shift = [(0.0, 0.0) for _ in range(n)]
+        self._plane_target_center[k] = (nx, ny)
+        self._plane_astro_shift[k] = (0.0, 0.0)
 
         self._define_center_waiting = False
-        try:
-            self._img_label.unbind("<Button-1>")
-        except tk.TclError:
-            pass
         self._start_cache_fill()
 
+    def _sync_fake_sat_controls_state(self) -> None:
+        """Enable diam/albedo/sat offset fields only when **Define PSF** has set a session PSF."""
+        from stars_analysis import stars_psf_source
+
+        ok = stars_psf_source() is not None
+        st = tk.NORMAL if ok else tk.DISABLED
+        for w in self._fake_sat_entries:
+            try:
+                w.configure(state=st)
+            except tk.TclError:
+                pass
+        fg = "" if ok else "gray50"
+        for lb in self._fake_sat_labels:
+            try:
+                lb.configure(foreground=fg)
+            except tk.TclError:
+                pass
+
     def _parse_params(self) -> tuple[float, float, float, float, float]:
+        from stars_analysis import stars_psf_source
+
         try:
             mag_max = float(self._mag_max_var.get().strip())
         except ValueError:
@@ -1284,6 +1546,8 @@ class StarsWindow(tk.Toplevel):
             sa = float(self._satang_var.get().strip())
         except ValueError:
             sa = 0.0
+        if stars_psf_source() is None:
+            diam = 0.0
         return diam, alb, sd, sa, mag_max
 
     def _display_xy_to_native_float(self, ix: int, iy: int) -> tuple[float, float] | None:
@@ -1354,7 +1618,6 @@ class StarsWindow(tk.Toplevel):
             return
         self._align_step = "pred"
         self._align_pred_native = None
-        self._img_label.bind("<Button-1>", self._on_align_b1)
         self._status.configure(
             text="Align: (1) Click inside a red circle (predicted star). "
             "(2) Then click near the true star — Esc cancels.",
@@ -1365,10 +1628,6 @@ class StarsWindow(tk.Toplevel):
             return
         self._align_step = None
         self._align_pred_native = None
-        try:
-            self._img_label.unbind("<Button-1>")
-        except tk.TclError:
-            pass
         try:
             k = int(round(float(self._idx_var.get())))
         except (ValueError, tk.TclError):
@@ -1420,13 +1679,10 @@ class StarsWindow(tk.Toplevel):
             px, py = self._align_pred_native
             dx = tx - px
             dy = ty - py
-            self._astro_shift = (self._astro_shift[0] + dx, self._astro_shift[1] + dy)
+            ox, oy = self._plane_astro_shift[k]
+            self._plane_astro_shift[k] = (ox + dx, oy + dy)
             self._align_step = None
             self._align_pred_native = None
-            try:
-                self._img_label.unbind("<Button-1>")
-            except tk.TclError:
-                pass
             self._start_cache_fill()
 
     def _reload_current(self) -> None:
@@ -1434,6 +1690,7 @@ class StarsWindow(tk.Toplevel):
 
     def _start_cache_fill(self) -> None:
         self._stop_play()
+        self._sync_fake_sat_controls_state()
         self._cache_fill_gen += 1
         fill_gen = self._cache_fill_gen
         n = len(self._paths)
@@ -1448,7 +1705,7 @@ class StarsWindow(tk.Toplevel):
         except tk.TclError:
             pass
         paths = list(self._paths)
-        adx, ady = self._astro_shift
+        astro_shifts = list(self._plane_astro_shift)
         target_centers = tuple(self._target_center_for_plane(i) for i in range(n))
         try:
             cur_idx = int(round(float(self._idx_var.get())))
@@ -1465,6 +1722,7 @@ class StarsWindow(tk.Toplevel):
             def compute_one(ii: int, p: Path) -> tuple[int, StarsPlaneResult | None, BaseException | None]:
                 try:
                     tc = target_centers[ii]
+                    adx, ady = astro_shifts[ii]
                     res = run_stars_plane(
                         p,
                         diam_m=diam,
@@ -1624,21 +1882,8 @@ class StarsWindow(tk.Toplevel):
             self._photo = ph
             self._img_label.configure(image=ph, text="")
             self._img_label.image = ph
-            nstar = len(ent.star_r_mag)
-            base = (
-                f"{len(self._paths)} file(s)  |  {display_fits_name(ent.path)}  |  "
-                f"{nstar} refcat star(s) (r band filter)"
-            )
-            if ent.five_sigma_radius_px is not None:
-                base += f"  |  5σ radius ≈ {ent.five_sigma_radius_px:.2f} px (corner σ; 1 m fakesat flux)"
-            ax, ay = self._astro_shift
-            if abs(ax) > 1e-9 or abs(ay) > 1e-9:
-                base += f"  |  astrometry Δ=({ax:+.2f},{ay:+.2f}) px native (cumulative)"
-            tc = self._target_center_for_plane(k)
-            if tc is not None:
-                base += f"  |  target center ({tc[0]:.1f},{tc[1]:.1f}) px native"
-                base += " (per-plane)" if self._per_plane_center_mode else " (shared)"
-            self._status.configure(text=base)
+            # Keep ``_status`` empty here: a long wrapped line shifts the image vertically.
+            self._status.configure(text="")
             self._detail.configure(text=display_fits_name(ent.path))
         elif isinstance(ent, BaseException):
             self._native_data = None
@@ -2043,7 +2288,24 @@ class FitsThumbViewer(tk.Tk):
         if src is not None:
             self._psf_status_var.set(f"Stars PSF: {display_fits_name(src)}")
         else:
-            self._psf_status_var.set("Stars PSF: per image")
+            self._psf_status_var.set("Stars PSF: not defined (fake satellite off)")
+
+    def _sync_open_stars_windows_fake_sat(self) -> None:
+        """Re-enable or grey Stars fake-satellite fields when Define PSF / Clear PSF runs."""
+
+        def walk(w: tk.Misc) -> None:
+            for ch in w.winfo_children():
+                if isinstance(ch, StarsWindow):
+                    try:
+                        ch.after_idle(ch._sync_fake_sat_controls_state)
+                    except tk.TclError:
+                        pass
+                walk(ch)
+
+        try:
+            walk(self.winfo_toplevel())
+        except tk.TclError:
+            pass
 
     def _define_psf(self) -> None:
         """Build PSF from one selected FITS; reuse for all Stars planes until cleared."""
@@ -2077,6 +2339,7 @@ class FitsThumbViewer(tk.Tk):
             return
         assert path_ok is not None
         self._refresh_psf_status()
+        self._sync_open_stars_windows_fake_sat()
         messagebox.showinfo("Define PSF", f"PSF defined from:\n{display_fits_name(path_ok)}")
 
     def _clear_psf(self) -> None:
@@ -2084,6 +2347,7 @@ class FitsThumbViewer(tk.Tk):
 
         clear_stars_psf_override()
         self._refresh_psf_status()
+        self._sync_open_stars_windows_fake_sat()
 
     def _apply_thumb_result(self, ph: ttk.Label, meta_lbl: ttk.Label, m: dict) -> None:
         if not ph.winfo_exists():

@@ -13,6 +13,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,9 +27,13 @@ from fullhill import (
     centroid_bright_near_center,
     ensure_square_1024,
     fakesat_flux,
-    geometry_from_spice,
     xyshift_cubic,
 )
+
+# Session cache: same pointing → identical refcat list (saves N subprocesses for N frames).
+_refcat_lock = threading.Lock()
+_refcat_cache: dict[tuple[float, float, float, float], list[dict[str, float]]] = {}
+_REFCAT_CACHE_MAX = 128
 from fits_thumb_viewer import (
     FULL_HILL_SIZE,
     arcsec_per_pixel_from_filename,
@@ -45,7 +50,7 @@ _STARS_PSF_SOURCE: Path | None = None
 
 
 def clear_stars_psf_override() -> None:
-    """Use per-plane ``lucy_getpsf`` again for Stars analysis."""
+    """Clear the PSF from **Define PSF**; fake-satellite injection stays off until a new PSF is set."""
     global _STARS_PSF_OVERRIDE, _STARS_PSF_SOURCE
     _STARS_PSF_OVERRIDE = None
     _STARS_PSF_SOURCE = None
@@ -69,10 +74,11 @@ def set_stars_psf_from_image(path: Path) -> None:
     _STARS_PSF_SOURCE = path.resolve()
 
 
-def _stars_psf_for_plane(raw1024: np.ndarray) -> np.ndarray:
-    if _STARS_PSF_OVERRIDE is not None:
-        return np.asarray(_STARS_PSF_OVERRIDE, dtype=np.float64)
-    return lucy_getpsf(raw1024.copy())
+def _stars_psf_override_array() -> np.ndarray | None:
+    """PSF for fake-satellite injection; ``None`` if **Define PSF** has not been used this session."""
+    if _STARS_PSF_OVERRIDE is None:
+        return None
+    return np.asarray(_STARS_PSF_OVERRIDE, dtype=np.float64)
 
 
 _DEFAULT_REFCAT_EXE = "/net/eris/data1/catalogs/atlas-refcat/refcat"
@@ -113,7 +119,16 @@ def _refcat_paths() -> tuple[str, str]:
 
 
 def refcat_stars(ra: float, dec: float, dr_deg: float, dd_deg: float) -> list[dict[str, float]]:
-    """Run atlas-refcat binary; parse lines into dicts (ra, dec, g, r, i, z, j, c, o)."""
+    """Run atlas-refcat binary; parse lines into dicts (ra, dec, g, r, i, z, j, c, o).
+
+    Cached by rounded (ra, dec, rect) so multiple FITS with the same field share one subprocess.
+    """
+    key = (round(ra, 8), round(dec, 8), round(dr_deg, 8), round(dd_deg, 8))
+    with _refcat_lock:
+        hit = _refcat_cache.get(key)
+    if hit is not None:
+        return [dict(s) for s in hit]
+
     exe, cat_dir = _refcat_paths()
     cmd = [
         exe,
@@ -163,6 +178,10 @@ def refcat_stars(ra: float, dec: float, dr_deg: float, dd_deg: float) -> list[di
                 "o": nums[8],
             }
         )
+    with _refcat_lock:
+        if len(_refcat_cache) >= _REFCAT_CACHE_MAX:
+            _refcat_cache.clear()
+        _refcat_cache[key] = [dict(s) for s in stars]
     return stars
 
 
@@ -241,16 +260,17 @@ def run_stars_plane(
     ``astrometry_dx``, ``astrometry_dy`` are added to every refcat native pixel position (same shift
     for all stars in the plane), e.g. from interactive alignment in the Stars window.
 
-    If ``target_center_native`` is set ``(x, y)`` in native pixels, it is used directly for
-    ``djx``, ``djy`` and ``xpred``, ``ypred`` — **no SPICE prediction** (avoids bad centroids on
-    saturated targets). Otherwise ``centroid_bright_near_center`` supplies ``djx``, ``djy`` for
-    fake-sat placement and :func:`lucy_spice.predicted_target_pixel_xy` supplies ``xpred``,
-    ``ypred`` for catalog alignment.
+    If ``target_center_native`` is set ``(x, y)`` in native pixels (Stars **Define center**), it
+    supplies ``djx``, ``djy`` for fake-sat placement while ``xpred``, ``ypred`` still come from
+    SPICE via :func:`lucy_spice.stars_ephemeris_bundle`. Refcat positions use
+    ``px + djx - xpred + astrometry``, so marking the true target fixes first-order alignment vs
+    ephemeris. Otherwise ``centroid_bright_near_center`` supplies ``djx``, ``djy``.
 
-    If :func:`set_stars_psf_from_image` was used (thumb viewer **Define PSF**), that PSF is used
-    for every plane instead of calling ``lucy_getpsf`` on each image.
+    Fake satellite injection and the 5σ / 1 m fakesat readout require a PSF from
+    :func:`set_stars_psf_from_image` (thumb viewer **Define PSF**). Without it, those features are
+    skipped and no per-plane ``lucy_getpsf`` is run.
 
-    Geometry (range/phase/delta) comes from SPICE via :func:`fullhill.geometry_from_spice`.
+    Geometry and predicted pixels come from SPICE via :func:`lucy_spice.stars_ephemeris_bundle`.
     """
     data, _hdr0 = get_image_data_and_header(path)
     plane = np.asarray(data, dtype=np.float64)
@@ -258,26 +278,24 @@ def run_stars_plane(
         plane = np.asarray(plane[:, :, 0], dtype=np.float64)
 
     raw1024 = ensure_square_1024(plane)
-    psf = _stars_psf_for_plane(raw1024)
+    psf = _stars_psf_override_array()
 
     _mean, median, std_full = sigma_clipped_stats(raw1024, sigma=3.0, maxiters=5)
     skysig_full = float(std_full) if std_full is not None and std_full > 0 else 1.0
     imp = raw1024 - float(median)
 
-    range_km, phase_deg, delta_km = geometry_from_spice(path)
     et = primary_exptime_seconds(path)
     if et is None or et <= 0:
         et = 1.0
 
+    from lucy_spice import stars_ephemeris_bundle
+
+    range_km, phase_deg, delta_km, xpred, ypred = stars_ephemeris_bundle(path)
     if target_center_native is not None:
         djx = float(target_center_native[0])
         djy = float(target_center_native[1])
-        xpred, ypred = djx, djy
     else:
         djx, djy = centroid_bright_near_center(imp)
-        from lucy_spice import predicted_target_pixel_xy
-
-        xpred, ypred = predicted_target_pixel_xy(path)
 
     satang_rad = math.radians(satang_deg)
     satx_km = satdist_km * math.cos(satang_rad)
@@ -285,7 +303,7 @@ def run_stars_plane(
     asp = arcsec_per_pixel_from_filename(path)
     kpp = asp / 3600.0 * (math.pi / 180.0) * range_km
 
-    if diam_m > 0.0:
+    if diam_m > 0.0 and psf is not None:
         flux_sat = fakesat_flux(diam_m, albedo, range_km, delta_km, phase_deg) * float(et)
         fake = np.zeros((1024, 1024), dtype=np.float64)
         fake[504:519, 504:519] = flux_sat * psf
@@ -339,11 +357,14 @@ def run_stars_plane(
             th = 20
         draw.text((xd + 2, yd - th - 4), label, fill=(255, 0, 0), font=font)
 
-    flux_1m = fakesat_flux(1.0, albedo, range_km, delta_km, phase_deg) * float(et)
-    corner = imp[900:1003, :] if imp.shape[0] > 1003 else imp
-    _mc, _med_c, std_c = sigma_clipped_stats(corner, sigma=3.0, maxiters=5)
-    skysig_corner = float(std_c) if std_c is not None and std_c > 0 else skysig_full
-    r5 = _five_sigma_radius_px(skysig_corner, flux_1m)
+    if psf is not None:
+        flux_1m = fakesat_flux(1.0, albedo, range_km, delta_km, phase_deg) * float(et)
+        corner = imp[900:1003, :] if imp.shape[0] > 1003 else imp
+        _mc, _med_c, std_c = sigma_clipped_stats(corner, sigma=3.0, maxiters=5)
+        skysig_corner = float(std_c) if std_c is not None and std_c > 0 else skysig_full
+        r5 = _five_sigma_radius_px(skysig_corner, flux_1m)
+    else:
+        r5 = None
 
     pairs = list(zip(xs, ys))
 
