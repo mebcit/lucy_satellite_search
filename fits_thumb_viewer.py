@@ -44,7 +44,7 @@ DEFAULT_ARCSEC_PER_PIXEL = 1.0
 LEGACY_THUMB_GLOB = "*_thumb.png"
 THUMB_MAX = 160
 FULL_HILL_SIZE = 1024
-# Local sky statistics on left-click (Stars / Stack): median, RMS from median, 5σ limits.
+# Local sky statistics on right-click (Stars / Stack): RMS from median, r_lim (IDL).
 SKY_REPORT_BOX = 30
 COLS = 4
 WORKERS = 2
@@ -78,67 +78,51 @@ def _clipped_square_box(
     return r0, r0 + bh, c0, c0 + bw
 
 
-def _patch_median_rms_npix(patch: np.ndarray) -> tuple[float, float, int]:
-    p = np.asarray(patch, dtype=np.float64).ravel()
-    p = p[np.isfinite(p)]
-    n = int(p.size)
-    if n == 0:
-        return float("nan"), float("nan"), 0
-    med = float(np.median(p))
-    rms = float(np.sqrt(np.mean((p - med) ** 2)))
-    return med, rms, n
+def _skysig_30x30_like_stars_corner(patch: np.ndarray) -> float | None:
+    """Per-pixel sky σ on a patch: same stats as ``run_stars_plane`` corner (``sigma_clipped_stats``).
+
+    Uses ``sigma=3``, ``maxiters=5`` on the 30×30 array, then the returned std — matching how
+    ``skysig`` is obtained for :func:`stars_analysis._five_sigma_radius_px` in the main pipeline,
+    but evaluated on the **click box** instead of ``imp[900:1003, :]``.
+    """
+    p = np.asarray(patch, dtype=np.float64)
+    if p.size < 2:
+        return None
+    try:
+        _, _, std = sigma_clipped_stats(p, sigma=3.0, maxiters=5)
+    except Exception:
+        return None
+    if std is None or not np.isfinite(float(std)) or float(std) <= 0:
+        return None
+    return float(std)
 
 
-def sky_box_five_sigma_integrated(rms: float, n_pix: int) -> float:
-    """Background-limited total counts at 5σ in an aperture of ``n_pix`` independent pixels."""
-    if n_pix <= 0 or not math.isfinite(rms):
-        return float("nan")
-    return float(5.0 * float(rms) * math.sqrt(float(n_pix)))
+def _sky_click_report_line(
+    skysig: float,
+    albedo: float,
+    range_km: float,
+    delta_km: float,
+    phase_deg: float,
+    exptime_s: float,
+) -> str | None:
+    """One line: ``skysig`` from 30×30 box, then ``r_lim`` (5σ limit; shown in **meters**).
 
+    Same as ``straight.pro`` / :func:`stars_analysis.run_stars_plane`: ``flux_1m = fakesat(1,…)*exptime``,
+    ``r_lim = sqrt(skysig*5*sqrt(π)/.93*5/flux_1m)``, with ``skysig`` taken from the local 30×30 patch
+    via :func:`_skysig_30x30_like_stars_corner` (same clipping as the corner strip, different region).
+    """
+    from fullhill import fakesat_flux
+    from stars_analysis import _five_sigma_radius_px
 
-def format_sky_box_report(
-    med: float,
-    rms: float,
-    five_pix: float,
-    flux_5: float,
-    n_pix: int,
-    r0: int,
-    r1: int,
-    c0: int,
-    c1: int,
-    diam_line: str | None,
-    *,
-    title_note: str = "",
-    error: str | None = None,
-) -> str:
-    """Multi-line text for the Stars / Stack 30×30 sky-box dialog."""
-    head = "30×30 sky box"
-    if title_note:
-        head += f" ({title_note})"
-    lines = [
-        head,
-        f"Box rows [{r0}:{r1}), cols [{c0}:{c1})  ({n_pix} px)",
-        f"median (sky) = {med:.8g}",
-        f"RMS from median = {rms:.8g}",
-        f"5×RMS (per-pixel) = {five_pix:.8g}",
-        f"5σ integrated limit = {flux_5:.8g} counts (5·RMS·√N, i.i.d. pixel noise)",
-        "",
-        "Equivalent sphere diameter (fakesat model, albedo from window):",
-    ]
-    if error:
-        lines.append(f"  —  ({error})")
-    elif diam_line:
-        lines.append(f"  {diam_line}")
+    if not math.isfinite(skysig):
+        return None
+    flux_1m = fakesat_flux(1.0, albedo, range_km, delta_km, phase_deg) * exptime_s
+    r_lim = _five_sigma_radius_px(float(skysig), float(flux_1m))
+    if r_lim is not None and math.isfinite(r_lim):
+        r_s = f"{r_lim:.4g} m (5 sigma)"
     else:
-        lines.append("  —")
-    lines.extend(
-        [
-            "",
-            "Diameter inverts fakesat_flux(D)×EXPTIME to match that integrated limit; treat as",
-            "order-of-magnitude (local box vs PSF-integrated point source).",
-        ]
-    )
-    return "\n".join(lines)
+        r_s = "—"
+    return f"rms={float(skysig):.6g} ct  r_lim={r_s}"
 
 
 def _display_to_native_xy(
@@ -807,7 +791,7 @@ class FullHillWindow(tk.Toplevel):
         self._img_label.pack()
         self._img_label.bind("<Motion>", self._on_probe_motion)
         self._img_label.bind("<Leave>", self._on_probe_leave)
-        self._img_label.bind("<Button-1>", self._on_stack_sky_box_click)
+        self._img_label.bind("<Button-3>", self._on_stack_sky_box_click)
 
         self.after_idle(self._run_pipeline)
 
@@ -823,7 +807,11 @@ class FullHillWindow(tk.Toplevel):
             self._play_btn.configure(text="Play")
 
     def _on_stack_sky_box_click(self, event: object) -> None:
-        """Left-click: 30×30 local median / RMS, 5σ, equivalent fakesat diameter (this plane)."""
+        """Right-click: 30×30 box → post rms + r_lim on main viewer."""
+        root = self.winfo_toplevel()
+        post = getattr(root, "set_sky_click_report", None)
+        if post is None:
+            return
         if self._busy:
             return
         if self._result is None or self._photo is None or self._fullhill_prep is None:
@@ -835,10 +823,8 @@ class FullHillWindow(tk.Toplevel):
         try:
             alb = self._parse_float(self._alb_var, "albedo")
         except ValueError:
-            messagebox.showerror("Stack", "Invalid albedo.")
+            post("")
             return
-
-        from fullhill import diameter_for_fakesat_total_counts
 
         name = self._stack_var.get()
         cube = getattr(self._result, name, None)
@@ -860,35 +846,19 @@ class FullHillWindow(tk.Toplevel):
         nc, nr = _display_to_native_xy(ix, iy, iw, ih, w, h)
         r0, r1, c0, c1 = _clipped_square_box(nr, nc, h, w, SKY_REPORT_BOX)
         patch = plane[r0:r1, c0:c1]
-        med, rms, n_pix = _patch_median_rms_npix(patch)
-        five_pix = 5.0 * rms if np.isfinite(rms) else float("nan")
-        flux_5 = sky_box_five_sigma_integrated(rms, n_pix)
+        skysig = _skysig_30x30_like_stars_corner(patch)
+        if skysig is None:
+            post("")
+            return
 
-        path_m = self._selected_paths[k_geo]
-        et = primary_exptime_seconds(path_m)
+        et = primary_exptime_seconds(self._selected_paths[k_geo])
         et_s = float(et) if et is not None and et > 0 else 1.0
         rr = float(prep.rr[k_geo])
         ph = float(prep.ph_deg[k_geo])
         dk = float(prep.delta_km[k_geo])
 
-        diam = diameter_for_fakesat_total_counts(flux_5, alb, rr, dk, ph, et_s)
-        d_s = f"{diam:.4g} m" if diam is not None and math.isfinite(diam) else "—"
-        messagebox.showinfo(
-            "Stack",
-            format_sky_box_report(
-                med,
-                rms,
-                five_pix,
-                flux_5,
-                n_pix,
-                r0,
-                r1,
-                c0,
-                c1,
-                d_s,
-                title_note="Stack",
-            ),
-        )
+        line = _sky_click_report_line(skysig, alb, rr, dk, ph, et_s)
+        post(line if line else "")
 
     def _toggle_play(self) -> None:
         if self._play_active:
@@ -1322,6 +1292,12 @@ class StarsWindow(tk.Toplevel):
             font=("TkFixedFont",),
         )
         self._probe_lbl.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self._sky_click_local_var = tk.StringVar(value="")
+        ttk.Label(
+            self,
+            textvariable=self._sky_click_local_var,
+            font=("TkFixedFont",),
+        ).pack(fill=tk.X, padx=8, pady=(0, 2))
 
         img_frame = ttk.Frame(self, padding=8)
         img_frame.pack(fill=tk.BOTH, expand=True)
@@ -1334,6 +1310,7 @@ class StarsWindow(tk.Toplevel):
         self._img_label.bind("<Motion>", self._on_probe_motion)
         self._img_label.bind("<Leave>", self._on_probe_leave)
         self._img_label.bind("<Button-1>", self._on_stars_image_b1)
+        self._img_label.bind("<Button-3>", self._on_sky_box_report_stars)
 
         self.bind("<Escape>", self._on_escape_stars)
         self.bind("<FocusIn>", lambda _e: self._sync_fake_sat_controls_state())
@@ -1348,6 +1325,7 @@ class StarsWindow(tk.Toplevel):
         self._align_pred_native = None
         try:
             self._img_label.unbind("<Button-1>")
+            self._img_label.unbind("<Button-3>")
         except tk.TclError:
             pass
         super().destroy()
@@ -1374,11 +1352,17 @@ class StarsWindow(tk.Toplevel):
             return
         if self._align_step is not None:
             self._on_align_b1(event)
-            return
-        self._on_sky_box_report_stars(event)
+
+    def _post_sky_click_line(self, line: str) -> None:
+        root = self.winfo_toplevel()
+        post = getattr(root, "set_sky_click_report", None)
+        if post is not None:
+            post(line)
+        else:
+            self._sky_click_local_var.set(line)
 
     def _on_sky_box_report_stars(self, event: object) -> None:
-        """Left-click (idle): 30×30 local median / RMS, 5σ, equivalent fakesat diameter."""
+        """Right-click: 30×30 box → post rms + r_lim on main viewer."""
         if self._native_data is None or self._photo is None:
             return
         xy = self._probe_image_xy(event)
@@ -1387,9 +1371,8 @@ class StarsWindow(tk.Toplevel):
         try:
             alb = float(self._alb_var.get().strip())
         except ValueError:
-            messagebox.showerror("Stars", "Invalid albedo.")
+            self._post_sky_click_line("")
             return
-        from fullhill import diameter_for_fakesat_total_counts
         from lucy_spice import stars_ephemeris_bundle
 
         ix, iy = xy
@@ -1400,9 +1383,10 @@ class StarsWindow(tk.Toplevel):
         nc, nr = _display_to_native_xy(ix, iy, iw, ih, w, h)
         r0, r1, c0, c1 = _clipped_square_box(nr, nc, h, w, SKY_REPORT_BOX)
         patch = plane[r0:r1, c0:c1]
-        med, rms, n_pix = _patch_median_rms_npix(patch)
-        five_pix = 5.0 * rms if np.isfinite(rms) else float("nan")
-        flux_5 = sky_box_five_sigma_integrated(rms, n_pix)
+        skysig = _skysig_30x30_like_stars_corner(patch)
+        if skysig is None:
+            self._post_sky_click_line("")
+            return
 
         try:
             k = int(round(float(self._idx_var.get())))
@@ -1412,48 +1396,16 @@ class StarsWindow(tk.Toplevel):
         path = self._paths[k]
         try:
             range_km, phase_deg, delta_km, _xp, _yp = stars_ephemeris_bundle(path)
-        except Exception as e:
-            messagebox.showinfo(
-                "Stars",
-                format_sky_box_report(
-                    med,
-                    rms,
-                    five_pix,
-                    flux_5,
-                    n_pix,
-                    r0,
-                    r1,
-                    c0,
-                    c1,
-                    None,
-                    title_note="Stars",
-                    error=str(e),
-                ),
-            )
+        except Exception:
+            self._post_sky_click_line("")
             return
 
         et = primary_exptime_seconds(path)
         et_s = float(et) if et is not None and et > 0 else 1.0
-        diam = diameter_for_fakesat_total_counts(
-            flux_5, alb, range_km, delta_km, phase_deg, et_s
+        line = _sky_click_report_line(
+            skysig, alb, range_km, delta_km, phase_deg, et_s
         )
-        d_s = f"{diam:.4g} m" if diam is not None and math.isfinite(diam) else "—"
-        messagebox.showinfo(
-            "Stars",
-            format_sky_box_report(
-                med,
-                rms,
-                five_pix,
-                flux_5,
-                n_pix,
-                r0,
-                r1,
-                c0,
-                c1,
-                d_s,
-                title_note="Stars",
-            ),
-        )
+        self._post_sky_click_line(line if line else "")
 
     def _start_define_center(self) -> None:
         if self._define_center_waiting:
@@ -2018,6 +1970,7 @@ class FitsThumbViewer(tk.Tk):
         self._row_group_ids: list[int] = []
         self._groups_paths: list[list[Path]] = []
         self._group_selection: dict[int, tk.BooleanVar] = {}
+        self._syncing_group_exclusive = False
         self._num_rows = 0
         self._materialized_rows: dict[int, ttk.Frame] = {}
         self._row_canvas_ids: dict[int, int] = {}
@@ -2056,6 +2009,12 @@ class FitsThumbViewer(tk.Tk):
         psf_status_row.pack(anchor=tk.W, pady=(4, 0))
         self._psf_status_var = tk.StringVar(value="Stars PSF: per image")
         ttk.Label(psf_status_row, textvariable=self._psf_status_var).pack(side=tk.LEFT)
+        self._sky_click_var = tk.StringVar(value="")
+        ttk.Label(
+            browse_col,
+            textvariable=self._sky_click_var,
+            font=("TkFixedFont",),
+        ).pack(anchor=tk.W, pady=(2, 0))
 
         hill_bar = ttk.Frame(self, padding=(8, 0, 8, 8))
         hill_bar.pack(fill=tk.X)
@@ -2114,6 +2073,10 @@ class FitsThumbViewer(tk.Tk):
         self.bind_all("<Button-5>", self._on_mousewheel_linux)
 
         self._load()
+
+    def set_sky_click_report(self, text: str) -> None:
+        """Show Stars/Stack right-click 30×30 result (rms + r_lim)."""
+        self._sky_click_var.set(text)
 
     def _on_close(self) -> None:
         for f in self._pending:
@@ -2226,10 +2189,25 @@ class FitsThumbViewer(tk.Tk):
                 v.set(False)
 
     def _sync_group_to_files(self, gid: int) -> None:
-        """Sync group checkbox to per-file flags (for future batch actions; Stack is off in Groups view)."""
+        """Sync group checkbox to per-file flags. Only one group may be on (radio-like)."""
+        if self._syncing_group_exclusive:
+            return
         val = self._group_selection[gid].get()
-        for p in self._groups_paths[gid]:
-            self._file_selection[p].set(val)
+        if val:
+            self._syncing_group_exclusive = True
+            try:
+                for other, var in self._group_selection.items():
+                    if other != gid:
+                        var.set(False)
+                        for p in self._groups_paths[other]:
+                            self._file_selection[p].set(False)
+                for p in self._groups_paths[gid]:
+                    self._file_selection[p].set(True)
+            finally:
+                self._syncing_group_exclusive = False
+        else:
+            for p in self._groups_paths[gid]:
+                self._file_selection[p].set(False)
 
     def _update_action_buttons_state(self) -> None:
         """Stack needs well-separated images (disabled in Groups). Stars works in both modes."""
@@ -2270,7 +2248,7 @@ class FitsThumbViewer(tk.Tk):
         selected = [p for p in self._files if self._file_selection[p].get()]
         if not selected:
             if self._group_selection:
-                msg = "Select at least one group (checkbox) to run Stars analysis."
+                msg = "Select a group (checkbox) to run Stars analysis."
             else:
                 msg = "Select at least one FITS file (checkbox) to run Stars analysis."
             messagebox.showinfo("Stars", msg)

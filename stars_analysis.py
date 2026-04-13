@@ -215,7 +215,16 @@ def _native_to_display_xy(
 
 
 def _five_sigma_radius_px(skysig: float, flux: float) -> float | None:
-    """IDL straight.pro: sqrt(skysig*5*sqrt(!pi)/.93*5/flux)."""
+    """IDL ``straight.pro`` (same line as the print): ``sqrt(skysig*5*sqrt(!pi)/.93*5/flux)``.
+
+    ``flux`` is total counts for a **1 m** sphere: ``fakesat(1.,...) * exptime``. ``skysig`` is the
+    per-pixel noise from the **corner** sky strip (``smallim`` in IDL; bottom rows of the 1024 image).
+
+    The factors ``5``, ``sqrt(π)``, and ``0.93`` encode the IDL recipe: 5σ in a **5 pixel radius**
+    aperture, with **0.93** aperture correction (fraction of PSF flux in that aperture). The result
+    is a **radius in native pixels** (same units as the IDL print), not meters — convert with
+    ``kpp`` (km/px) if you need physical size.
+    """
     if not np.isfinite(skysig) or not np.isfinite(flux) or flux <= 0:
         return None
     try:

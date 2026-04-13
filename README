@@ -1,3 +1,0 @@
-I think the thing to do is to make a sphere of healpix areas as a function of radius. Then, for each observations, calculate the smallest thing that could be found, and populate the sphere. The sphere is 3D so includes the motion of the spacecraft.
-
-You could figure out the "dark" background level and where it applies and do that automatically. Not sure yet how to efficiently deal with the PSF and scattered light, though possibly empirically?

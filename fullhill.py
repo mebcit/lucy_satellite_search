@@ -403,6 +403,9 @@ class FullHillPrep:
 
     imb: np.ndarray
     psf: list[np.ndarray]
+    #: Per-plane primary ``EXPTIME`` from each **main** FITS (seconds), via
+    #: :func:`fits_thumb_viewer.primary_exptime_seconds`. Used for ``fakesat_flux * exptime``;
+    #: not the short mate's ``EXPTIME``, and not :attr:`exposure_scale` (``et_m / et_short``).
     et_m: np.ndarray
     rr: np.ndarray
     ph_deg: np.ndarray
@@ -599,6 +602,7 @@ def run_fullhill_from_prep(
             satx_km = satdist_km * math.cos(satang_rad + dt_sec * om)
             saty_km = satdist_km * math.sin(satang_rad + dt_sec * om)
 
+            # Total counts: IDL fakesat × main-frame EXPTIME (same file as this stack plane).
             flux = (
                 fakesat_flux(diam_m, albedo, rr[i], prep.delta_km[i], prep.ph_deg[i])
                 * prep.et_m[i]
