@@ -1,3 +1,51 @@
+# IDL / legacy
 *.prof
 fullhillshifts.dat
 *.sav
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / install
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tests & tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / IDE
+.idea/
+.vscode/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (keep satsearch.toml tracked)
+.env
+*.pem
+
+# Local FITS data (force-add with `git add -f` if you version small test files)
+*.fit
+*.fits
+*.fts
+
+# Thumbnail cache next to FITS (see fits_thumb_viewer)
+*_thumb*.png
