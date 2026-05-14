@@ -34,7 +34,6 @@ from PIL import Image, ImageDraw, ImageTk
 
 
 FITS_EXTENSIONS = (".fits", ".fit", ".fts")
-DEFAULT_SUBDIR = Path("..") / "llori" / "2025110"
 CA_REF_JD = 2460786.2439811
 DEFAULT_HILL_KM = 711.0
 # Filename pattern e.g. ``lor_…_4x4_sci_01.fit`` → 4 arcsec / pixel.
@@ -134,13 +133,9 @@ def _display_to_native_xy(
 
 
 def default_root_dir() -> Path:
-    try:
-        from satsearch_config import get_config
+    from satsearch_config import get_config
 
-        return get_config().paths.default_fits_directory
-    except Exception:
-        base = Path(__file__).resolve().parent
-        return (base / DEFAULT_SUBDIR).resolve()
+    return get_config().paths.default_fits_directory
 
 
 def list_fits_files(directory: Path) -> list[Path]:
@@ -2639,6 +2634,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    from satsearch_config import get_config
+
+    get_config()  # Require valid ``satsearch.toml`` before any Tk setup.
+
     if args.stars:
         root = tk.Tk()
         root.title("")
