@@ -10,7 +10,6 @@ the stack’s use of centroid for injection while stars align to the ephemeris p
 from __future__ import annotations
 
 import math
-import os
 import re
 import subprocess
 import threading
@@ -34,7 +33,7 @@ from fullhill import (
 _refcat_lock = threading.Lock()
 _refcat_cache: dict[tuple[float, float, float, float], list[dict[str, float]]] = {}
 _REFCAT_CACHE_MAX = 128
-from fits_thumb_viewer import (
+from satsearch import (
     FULL_HILL_SIZE,
     arcsec_per_pixel_from_filename,
     data_to_thumbnail_u8,
@@ -44,7 +43,7 @@ from fits_thumb_viewer import (
 )
 from lucy_getpsf import lucy_getpsf
 
-# Optional global PSF from "Define PSF" in FitsThumbViewer (one image with enough stars).
+# Optional global PSF from "Define PSF" in the main window (`satsearch.FitsThumbViewer`).
 _STARS_PSF_OVERRIDE: np.ndarray | None = None
 _STARS_PSF_SOURCE: Path | None = None
 
@@ -81,19 +80,7 @@ def _stars_psf_override_array() -> np.ndarray | None:
     return np.asarray(_STARS_PSF_OVERRIDE, dtype=np.float64)
 
 
-_DEFAULT_REFCAT_EXE = "/net/eris/data1/catalogs/atlas-refcat/refcat"
-_DEFAULT_REFCAT_DIR = "/net/eris/data1/catalogs/atlas-refcat/00_m_16"
 _REFCAT_RECT_DEG = 0.3
-
-
-def _config_refcat_paths() -> tuple[str, str] | None:
-    try:
-        from satsearch_config import get_config
-
-        p = get_config().paths
-        return str(p.refcat_exe), str(p.refcat_dir)
-    except Exception:
-        return None
 
 
 def _mag_annotate_font():
@@ -110,12 +97,10 @@ def _mag_annotate_font():
 
 
 def _refcat_paths() -> tuple[str, str]:
-    cfg = _config_refcat_paths()
-    if cfg is not None:
-        return cfg
-    exe = os.environ.get("SATSEARCH_REFCAT_EXE", _DEFAULT_REFCAT_EXE)
-    d = os.environ.get("SATSEARCH_REFCAT_DIR", _DEFAULT_REFCAT_DIR)
-    return exe, d
+    from satsearch_config import get_config
+
+    r = get_config().refcat
+    return str(r.executable), str(r.catalog_dir)
 
 
 def refcat_stars(ra: float, dec: float, dr_deg: float, dd_deg: float) -> list[dict[str, float]]:

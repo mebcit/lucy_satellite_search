@@ -1,20 +1,30 @@
-# Copy to ``satsearch.toml`` in this directory (or set SATSEARCH_CONFIG to a TOML path).
-# Paths are examples — point SPICE meta-kernels (.tm), refcat, and the default FITS folder at your site.
+# Copy to ``satsearch.toml`` next to ``satsearch_config.py`` (or set SATSEARCH_CONFIG).
+#
+# ALL of the tables and keys below are REQUIRED, except optional keys called out in comments
+# (``[spice].kernel_data_root`` and ``path_values_snapshot_prefix``). The application exits on
+# startup if this file is missing, if any required key is omitted or blank, or if any path does
+# not exist on disk.
+# Replace every path with values valid on YOUR machine — the examples will not work as-is.
 
 [spice]
-# NAIF/CSPICE meta-kernel(s) to load with furnsh (order matters; leapseconds usually included).
-meta_kernels = [
-    "/home/mbrown/lucy/kernels/mk/lcy.donj.science.LATEST.tm",
-]
-# Names must match loaded SPICE kernels (see kernel comments for NAIF IDs).
-target_body = "DONALDJOHANSON"
+# Directory containing NAIF meta-kernel (``.tm``) files. ``encounters.toml`` lists bare filenames only.
+meta_kernel_dir = "/home/mbrown/disks/data/lucy/spice/mk"
+# Optional: when Lucy (or other) ``.tm`` files embed another machine's ``PATH_VALUES`` (e.g. ``/mnt/lucy/soc/spice``),
+# set this to the directory on **your** disk that contains ``spk/``, ``fk/``, ``ik/``, etc. Satsearch rewrites the
+# snapshot prefix in a temp copy of each ``.tm`` before ``furnsh`` — you do not need to edit the shipped meta-kernels.
+# kernel_data_root = "/home/mbrown/disks/data/lucy/spice"
+# Optional; defaults to /mnt/lucy/soc/spice when ``kernel_data_root`` is set. Change only if your ``.tm`` files use a different SOC path.
+# path_values_snapshot_prefix = "/mnt/lucy/soc/spice"
 observer_body = "LUCY"
 sun_body = "SUN"
 frame = "J2000"
 abcorr = "NONE"
 
+[refcat]
+# atlas-refcat: ``refcat`` binary and local catalog tile root (both required).
+executable = "/net/eris/data1/catalogs/atlas-refcat/refcat"
+catalog_dir = "/net/eris/data1/catalogs/atlas-refcat/00_m_16"
+
 [paths]
-refcat_exe = "/net/eris/data1/catalogs/atlas-refcat/refcat"
-refcat_dir = "/net/eris/data1/catalogs/atlas-refcat/00_m_16"
 # Initial directory for the FITS thumbnail browser (Browse… can change it).
-default_fits_directory = "/home/mbrown/lucy/dj/satsearch/../llori/2025110"
+default_fits_directory = "/home/mbrown/disks/data/lucy/llori/2025110"

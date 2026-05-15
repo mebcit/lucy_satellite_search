@@ -1,0 +1,19 @@
+[[encounter]]
+id = "DJ"
+target_body = "DONALDJOHANSON"
+default_fits_directory = "2025110"
+meta_kernels = [
+    "lcy.donj.science.LATEST.tm",
+]
+hill_sphere_km = 711.0
+closest_approach_utc = "2025-04-20T17:51:29.929"
+
+[[encounter]]
+id = "Dinky"
+target_body = "DINKINESH"
+default_fits_directory = "2023305"
+meta_kernels = [
+    "lcy.dnky.dl.v12.tm",
+]
+hill_sphere_km = 120.0
+closest_approach_utc = "2023-11-01T16:54:38.165"

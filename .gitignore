@@ -50,5 +50,5 @@ Thumbs.db
 *.fits
 *.fts
 
-# Thumbnail cache next to FITS (see fits_thumb_viewer)
+# Thumbnail cache next to FITS (see satsearch.py)
 *_thumb*.png

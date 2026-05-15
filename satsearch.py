@@ -13,6 +13,8 @@ Arcseconds per pixel for the Hill line comes from the filename (``…_1x1_…`` 
 Small-angle: ``θ≈H/R`` rad → arcsec → native pixels via ``θ_arcsec / (arcsec/pixel)``.
 When the FITS header has no ``SPCTRANG``/``SPCTRANGE``, Lucy–target distance for the Hill line
 can come from SPICE (see :mod:`lucy_spice`) if ``satsearch.toml`` and kernels are configured.
+Per-target defaults (kernels, FITS folder, default Hill radius) come from ``encounters.toml``;
+use the **Encounter** control beside **Directory** to switch targets.
 """
 
 from __future__ import annotations
@@ -24,7 +26,8 @@ import re
 import sys
 import threading
 import tkinter as tk
-from pathlib import Path
+from collections.abc import Callable
+from pathlib import Path, PurePath
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
@@ -34,10 +37,12 @@ from PIL import Image, ImageDraw, ImageTk
 
 
 FITS_EXTENSIONS = (".fits", ".fit", ".fts")
+# Legacy DJ closest-approach JD when ``encounters.toml`` has no ``closest_approach_utc`` for the active encounter.
 CA_REF_JD = 2460786.2439811
-DEFAULT_HILL_KM = 711.0
 # Filename pattern e.g. ``lor_…_4x4_sci_01.fit`` → 4 arcsec / pixel.
 _BINNING_RE = re.compile(r"_(\d+)x(\d+)_", re.IGNORECASE)
+# Science frame index before extension: ``…_sci_01.fit`` vs duplicate ``…_02.fit``, ``…_03.fit``.
+_SCI_01_SUFFIX_RE = re.compile(r"_01\.(fits?|fts?)$", re.IGNORECASE)
 DEFAULT_ARCSEC_PER_PIXEL = 1.0
 # Old cache files before Hill radius was encoded in the filename.
 LEGACY_THUMB_GLOB = "*_thumb.png"
@@ -47,6 +52,7 @@ FULL_HILL_SIZE = 1024
 SKY_REPORT_BOX = 30
 COLS = 4
 WORKERS = 2
+STACK_WORKERS = 40
 # Fixed row height for virtual scrolling (avoids one X pixmap per file — BadAlloc).
 ROW_HEIGHT = 300
 ROW_OVERSCAN = 1
@@ -124,6 +130,21 @@ def _sky_click_report_line(
     return f"rms={float(skysig):.6g} ct  r_lim={r_s}"
 
 
+def _resolve_set_sky_click_poster(widget: tk.Misc):
+    """Return ``main.set_sky_click_report`` if ``widget`` lives under :class:`FitsThumbViewer`.
+
+    ``winfo_toplevel()`` on a ``tk.Toplevel`` is that dialog, not the thumbnail browser, so
+    Stack/Stars used to find no poster and (Stack) dropped right-clicks silently.
+    """
+    w = widget.master
+    while w is not None:
+        post = getattr(w, "set_sky_click_report", None)
+        if callable(post):
+            return post
+        w = w.master
+    return None
+
+
 def _display_to_native_xy(
     ix: int, iy: int, iw: int, ih: int, nw: int, nh: int
 ) -> tuple[float, float]:
@@ -133,9 +154,43 @@ def _display_to_native_xy(
 
 
 def default_root_dir() -> Path:
+    from satsearch_config import get_active_encounter, get_config
+
+    enc = get_active_encounter()
+    if enc is not None:
+        return enc.default_fits_directory
+    return get_config().paths.default_fits_directory
+
+
+def _fits_directory_parent() -> Path:
+    """Parent of ``[paths].default_fits_directory`` (same root as encounter FITS subfolders)."""
     from satsearch_config import get_config
 
-    return get_config().paths.default_fits_directory
+    return get_config().paths.default_fits_directory.expanduser().resolve().parent
+
+
+def thumb_dir_display(path: Path) -> str:
+    """Directory field text: last path component when under the configured FITS parent, else full path."""
+    path = path.expanduser().resolve()
+    parent = _fits_directory_parent()
+    try:
+        path.relative_to(parent)
+        return path.name
+    except ValueError:
+        return str(path)
+
+
+def thumb_dir_from_field(field: str) -> Path:
+    """Resolve Directory entry to an absolute path (bare name = under ``_fits_directory_parent()``)."""
+    s = (field or "").strip()
+    if not s:
+        return default_root_dir()
+    p = Path(s)
+    if p.is_absolute():
+        return p.expanduser().resolve()
+    if len(PurePath(s).parts) != 1:
+        return p.expanduser().resolve()
+    return (_fits_directory_parent() / s).expanduser().resolve()
 
 
 def list_fits_files(directory: Path) -> list[Path]:
@@ -170,6 +225,11 @@ def is_1x1_binned_filename(path: Path) -> bool:
     if not m:
         return False
     return int(m.group(1)) == 1 and int(m.group(2)) == 1
+
+
+def is_sci_exposure_01_filename(path: Path) -> bool:
+    """True if basename ends with ``_01.fit`` / ``_01.fits`` / ``_01.fts`` (science index 01)."""
+    return bool(_SCI_01_SUFFIX_RE.search(path.name))
 
 
 def thumb_cache_path(fits_path: Path, hill_km: float, arcsec_per_pixel: float) -> Path:
@@ -409,7 +469,12 @@ def filter_paths_by_sap_keywords(
 _GROUP_MAX_TIME_SPAN_SEC = 10.0
 
 
-def compute_exposure_groups(paths: list[Path], max_span_sec: float = _GROUP_MAX_TIME_SPAN_SEC) -> list[list[Path]]:
+def compute_exposure_groups(
+    paths: list[Path],
+    max_span_sec: float = _GROUP_MAX_TIME_SPAN_SEC,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> list[list[Path]]:
     """Cluster paths into simultaneous bursts.
 
     Observations are sorted by time (JD as seconds). The timeline is split into
@@ -419,15 +484,29 @@ def compute_exposure_groups(paths: list[Path], max_span_sec: float = _GROUP_MAX_
     clock-aligned boundaries). Within each segment, paths are partitioned by
     (rounded) EXPTIME; only the longest-EXPTIME subset is kept. Singleton groups
     are omitted. Paths missing MIDUTCJD or EXPTIME are omitted.
+
+    ``progress(done, total)`` is called occasionally while reading FITS headers
+    (``done`` files processed of ``total``); use it to pulse a busy UI on the main thread.
     """
+    n_paths = len(paths)
+    if n_paths == 0:
+        return []
+    if progress is not None:
+        progress(0, n_paths)
+    step = 1 if n_paths < 120 else max(1, n_paths // 50)
+
     records: list[tuple[Path, float, float]] = []
-    for p in paths:
+    for k, p in enumerate(paths):
         jd = primary_midutcjd(p)
         et = primary_exptime_seconds(p)
         if jd is None or et is None:
             continue
         t_sec = float(jd) * 86400.0
         records.append((p, t_sec, float(et)))
+        if progress is not None and (k + 1 == n_paths or (k + 1) % step == 0):
+            progress(k + 1, n_paths)
+    if progress is not None:
+        progress(n_paths, n_paths)
     if not records:
         return []
     records.sort(key=lambda r: (r[1], r[0].name))
@@ -514,6 +593,39 @@ def data_to_thumbnail_u8(data: np.ndarray, vmin: float, vmax: float, size: int) 
     return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
 
+def _jd_from_iso_utc_closest(s: str) -> float | None:
+    """Parse ``closest_approach_utc`` (UTC string from CSPICE ``ISOC`` or similar) to Julian date."""
+    from astropy.time import Time
+
+    raw = (s or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1]
+        t = Time(raw, scale="utc")
+        jd = float(t.jd)
+        return jd if math.isfinite(jd) else None
+    except Exception:
+        return None
+
+
+def thumb_ca_ref_jd() -> float:
+    """Julian date of closest approach for Δt CA in thumbnails and Stack (active encounter).
+
+    Uses :attr:`satsearch_config.Encounter.closest_approach_utc` when set; otherwise the legacy
+    constant :data:`CA_REF_JD` (DJ flyby reference).
+    """
+    from satsearch_config import get_active_encounter
+
+    enc = get_active_encounter()
+    if enc is not None and enc.closest_approach_utc:
+        jd = _jd_from_iso_utc_closest(enc.closest_approach_utc)
+        if jd is not None:
+            return jd
+    return CA_REF_JD
+
+
 def overlay_hill_sphere_line(
     img: Image.Image,
     native_hw: tuple[int, int],
@@ -521,10 +633,13 @@ def overlay_hill_sphere_line(
     range_km: float | None,
     arcsec_per_pixel: float = DEFAULT_ARCSEC_PER_PIXEL,
 ) -> Image.Image:
-    """Draw a red horizontal segment near the top: center dot, ±Hill km at ``range_km``.
+    """Draw Hill markers near the top: red full Hill diameter (clipped to image width), blue reference.
 
     Small-angle: ``θ_rad ≈ hill_km / range_km``, then ``θ_arcsec = θ_rad × (180/π) × 3600``;
     half-length in native pixels = ``θ_arcsec / arcsec_per_pixel`` (from filename ``_1x1_`` / ``_4x4_``).
+
+    The red segment is clipped so it fits within the thumbnail. The blue segment uses **one third**
+    of the **unclipped** full Hill half-length in thumbnail pixels (may extend past the image edges).
     """
     nh, nw = native_hw
     tw, th = img.size
@@ -543,8 +658,10 @@ def overlay_hill_sphere_line(
     theta_arcsec = theta_rad * (180.0 / np.pi) * 3600.0
     half_native_px = theta_arcsec / asp
     scale = tw / float(nw)
-    half_thumb = float(half_native_px * scale)
-    half_thumb = min(half_thumb, tw / 2.0 - 1.0)
+    half_thumb_full = float(half_native_px * scale)
+    if half_thumb_full < 0.5:
+        return rgb
+    half_thumb = min(half_thumb_full, tw / 2.0 - 1.0)
     if half_thumb < 0.5:
         return rgb
     cx = tw / 2.0
@@ -553,21 +670,27 @@ def overlay_hill_sphere_line(
     x1 = cx + half_thumb
     dr = ImageDraw.Draw(rgb)
     r_dot = max(2, min(th, tw) // 64)
+    w_line = max(1, min(th, tw) // 120)
+    dr.line([(x0, y_line), (x1, y_line)], fill=(255, 0, 0), width=w_line)
+    half_blue = half_thumb_full / 3.0
+    dr.line(
+        [(cx - half_blue, y_line), (cx + half_blue, y_line)],
+        fill=(0, 96, 255),
+        width=w_line,
+    )
     dr.ellipse(
         [cx - r_dot, y_line - r_dot, cx + r_dot, y_line + r_dot],
         fill=(255, 0, 0),
         outline=(255, 0, 0),
     )
-    w_line = max(1, min(th, tw) // 120)
-    dr.line([(x0, y_line), (x1, y_line)], fill=(255, 0, 0), width=w_line)
     return rgb
 
 
-def _fill_header_meta(meta: dict, headers: list[fits.Header]) -> None:
+def _fill_header_meta(meta: dict, headers: list[fits.Header], *, ca_ref_jd: float) -> None:
     meta["sapid"] = _header_str_chain(headers, "SAPID")
     jd = _midutcjd_from_headers(headers)
     if jd is not None:
-        meta["hours_to_ca"] = (jd - CA_REF_JD) * 24.0
+        meta["hours_to_ca"] = (jd - ca_ref_jd) * 24.0
     et = _header_float_chain(headers, "EXPTIME")
     if et is not None:
         meta["exptime"] = et
@@ -579,7 +702,7 @@ def _fill_header_meta(meta: dict, headers: list[fits.Header]) -> None:
         meta["range_int"] = None
 
 
-def load_thumb_job(path: Path, hill_km: float) -> dict:
+def load_thumb_job(path: Path, hill_km: float, ca_ref_jd: float) -> dict:
     meta = {
         "path": path,
         "basename": display_fits_name(path),
@@ -597,7 +720,7 @@ def load_thumb_job(path: Path, hill_km: float) -> dict:
     try:
         headers = headers_for_metadata(path)
         header_rk = _range_km_from_headers(headers)
-        _fill_header_meta(meta, headers)
+        _fill_header_meta(meta, headers, ca_ref_jd=ca_ref_jd)
         if header_rk is None and meta.get("range_km") is None:
             try:
                 from lucy_spice import range_km_for_display
@@ -803,8 +926,7 @@ class FullHillWindow(tk.Toplevel):
 
     def _on_stack_sky_box_click(self, event: object) -> None:
         """Right-click: 30×30 box → post rms + r_lim on main viewer."""
-        root = self.winfo_toplevel()
-        post = getattr(root, "set_sky_click_report", None)
+        post = _resolve_set_sky_click_poster(self)
         if post is None:
             return
         if self._busy:
@@ -927,6 +1049,7 @@ class FullHillWindow(tk.Toplevel):
 
         paths = list(self._selected_paths)
         all_s = list(self._all_sorted)
+        ca_jd = thumb_ca_ref_jd()
 
         def work() -> None:
             try:
@@ -934,11 +1057,17 @@ class FullHillWindow(tk.Toplevel):
 
                 prep_in = self._fullhill_prep
                 if prep_in is None:
-                    prep_new = run_fullhill_prepare(paths, all_s)
-                    res = run_fullhill_from_prep(prep_new, diam, alb, sd, sa)
+                    prep_new = run_fullhill_prepare(
+                        paths, all_s, ca_ref_jd=ca_jd, max_workers=STACK_WORKERS
+                    )
+                    res = run_fullhill_from_prep(
+                        prep_new, diam, alb, sd, sa, max_workers=STACK_WORKERS
+                    )
                     self.after(0, lambda: self._apply_result(res, prep_new, from_cache=False))
                 else:
-                    res = run_fullhill_from_prep(prep_in, diam, alb, sd, sa)
+                    res = run_fullhill_from_prep(
+                        prep_in, diam, alb, sd, sa, max_workers=STACK_WORKERS
+                    )
                     self.after(0, lambda: self._apply_result(res, from_cache=True))
             except Exception as e:
                 self.after(0, lambda err=e: self._fail(err))
@@ -1182,7 +1311,7 @@ class StarsWindow(tk.Toplevel):
         self._native_data: np.ndarray | None = None
         self._cache_fill_gen = 0
         self._plane_cache: list[object | None] = []
-        self._tk_photos: list[ImageTk.PhotoImage | None] = []
+        self._plane_pil_images: list[Image.Image | None] = []
         self._align_step: str | None = None
         self._align_pred_native: tuple[float, float] | None = None
         self._define_center_waiting = False
@@ -1191,8 +1320,9 @@ class StarsWindow(tk.Toplevel):
         # Per-plane manual refcat tweak after **Align** (additive to djx−xpred term).
         self._plane_astro_shift: list[tuple[float, float]] = [(0.0, 0.0) for _ in range(n)]
 
-        self.geometry("1100x1000")
-        self.minsize(640, 480)
+        # Preview is up to ``FULL_HILL_SIZE`` (1024) on the long axis; leave room for controls.
+        self.geometry("1280x1560")
+        self.minsize(960, 880)
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
@@ -1272,17 +1402,17 @@ class StarsWindow(tk.Toplevel):
         self._status = ttk.Label(
             self,
             text=f"{n} file(s)  |  loading…",
-            wraplength=920,
+            wraplength=1180,
         )
         self._status.pack(fill=tk.X, padx=8, pady=(0, 4))
 
-        self._detail = ttk.Label(self, text="", wraplength=920, justify=tk.LEFT)
+        self._detail = ttk.Label(self, text="", wraplength=1180, justify=tk.LEFT)
         self._detail.pack(fill=tk.X, padx=8, pady=(0, 4))
 
         self._probe_lbl = ttk.Label(
             self,
             text="",
-            wraplength=920,
+            wraplength=1180,
             justify=tk.LEFT,
             font=("TkFixedFont",),
         )
@@ -1349,8 +1479,7 @@ class StarsWindow(tk.Toplevel):
             self._on_align_b1(event)
 
     def _post_sky_click_line(self, line: str) -> None:
-        root = self.winfo_toplevel()
-        post = getattr(root, "set_sky_click_report", None)
+        post = _resolve_set_sky_click_poster(self)
         if post is not None:
             post(line)
         else:
@@ -1642,7 +1771,7 @@ class StarsWindow(tk.Toplevel):
         fill_gen = self._cache_fill_gen
         n = len(self._paths)
         self._plane_cache = [None] * n
-        self._tk_photos = [None] * n
+        self._plane_pil_images = [None] * n
         params = self._parse_params()
         self._status.configure(
             text=f"{n} file(s)  |  computing all {n} plane(s) in parallel (cached for slider)…",
@@ -1711,7 +1840,7 @@ class StarsWindow(tk.Toplevel):
         if fill_gen != self._cache_fill_gen:
             return
         self._plane_cache[i] = err
-        self._tk_photos[i] = None
+        self._plane_pil_images[i] = None
         self._update_status_counts()
         try:
             cur = int(round(float(self._idx_var.get())))
@@ -1731,8 +1860,9 @@ class StarsWindow(tk.Toplevel):
         if not isinstance(res, StarsPlaneResult):
             return
         self._plane_cache[i] = res
-        # master=self keeps PhotoImage tied to this Toplevel; .copy() avoids stale buffers.
-        self._tk_photos[i] = ImageTk.PhotoImage(res.pil_image.copy(), master=self)
+        # Cache the PIL render, not the Tk image. Creating a fresh PhotoImage in _show_plane
+        # avoids occasional stale Tk image state during playback while keeping overlays atomic.
+        self._plane_pil_images[i] = res.pil_image.copy()
         self._update_status_counts()
         try:
             cur = int(round(float(self._idx_var.get())))
@@ -1822,13 +1952,13 @@ class StarsWindow(tk.Toplevel):
         self._idx_var.set(float(k))
         self._plane_lbl.configure(text=f"{k + 1} / {len(self._paths)}")
         ent = self._plane_cache[k] if k < len(self._plane_cache) else None
-        ph = self._tk_photos[k] if k < len(self._tk_photos) else None
+        pil = self._plane_pil_images[k] if k < len(self._plane_pil_images) else None
 
-        if isinstance(ent, StarsPlaneResult) and ph is not None:
+        if isinstance(ent, StarsPlaneResult) and pil is not None:
             self._native_data = ent.native_display
-            self._photo = ph
-            self._img_label.configure(image=ph, text="")
-            self._img_label.image = ph
+            self._photo = ImageTk.PhotoImage(pil.copy(), master=self)
+            self._img_label.configure(image=self._photo, text="")
+            self._img_label.image = self._photo
             # Keep ``_status`` empty here: a long wrapped line shifts the image vertically.
             self._status.configure(text="")
             self._detail.configure(text=display_fits_name(ent.path))
@@ -1952,12 +2082,20 @@ class StarsWindow(tk.Toplevel):
             pass
 
 
+def _spice_kernel_display_string() -> str:
+    """Bare meta-kernel filenames for the active SPICE stack (``get_spice_runtime``)."""
+    from satsearch_config import get_spice_runtime
+
+    paths = get_spice_runtime().meta_kernels
+    return " ; ".join(p.name for p in paths) if paths else ""
+
+
 class FitsThumbViewer(tk.Tk):
     def __init__(self, *, min_exp_default: str = "0") -> None:
         super().__init__()
         self.title("FITS thumbnails (Lucy LORRI)")
         self.geometry("1100x720")
-        self._dir_var = tk.StringVar(value=str(default_root_dir()))
+        self._dir_var = tk.StringVar(value=thumb_dir_display(default_root_dir()))
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
         self._pending: set[concurrent.futures.Future] = set()
         self._files: list[Path] = []
@@ -1976,14 +2114,36 @@ class FitsThumbViewer(tk.Tk):
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
-        top.columnconfigure(1, weight=1)
-        ttk.Label(top, text="Directory:").grid(row=0, column=0, sticky="nw", pady=(2, 0))
-        self._entry = ttk.Entry(top, textvariable=self._dir_var, width=72)
-        self._entry.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        # Column 2: "Directory:" / "Kernel:" (same width for aligned text fields in col 3).
+        top.columnconfigure(2, minsize=72)
+        top.columnconfigure(3, weight=1)
+        from satsearch_config import default_hill_sphere_km, get_active_encounter, get_encounters
+
+        enc_ids = [e.id for e in get_encounters()]
+        active = get_active_encounter()
+        if active is None or active.id not in enc_ids:
+            self._encounter_var = tk.StringVar(value=enc_ids[0])
+        else:
+            self._encounter_var = tk.StringVar(value=active.id)
+        ttk.Label(top, text="Encounter:").grid(row=0, column=0, sticky="e", pady=(2, 0))
+        self._encounter_cb = ttk.Combobox(
+            top,
+            textvariable=self._encounter_var,
+            values=enc_ids,
+            state="readonly",
+            width=10,
+        )
+        self._encounter_cb.grid(row=0, column=1, sticky="w", padx=(4, 16), pady=(2, 0))
+        self._encounter_cb.bind("<<ComboboxSelected>>", self._on_encounter_selected)
+
+        ttk.Label(top, text="Directory:").grid(row=0, column=2, sticky="e", pady=(2, 0))
+        self._entry = ttk.Entry(top, textvariable=self._dir_var)
+        self._entry.grid(row=0, column=3, sticky="ew", padx=(6, 8), pady=(2, 0))
+
         browse_col = ttk.Frame(top)
-        browse_col.grid(row=0, column=2, sticky="nw")
+        browse_col.grid(row=0, column=4, rowspan=2, sticky="ne", padx=(8, 0))
         btn_row = ttk.Frame(browse_col)
-        btn_row.pack(anchor=tk.W)
+        btn_row.pack(anchor=tk.E)
         ttk.Button(btn_row, text="Browse…", command=self._browse).pack(side=tk.LEFT)
         ttk.Button(btn_row, text="Load", command=self._load).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(btn_row, text="Clear all selections", command=self._clear_all_selections).pack(
@@ -1991,7 +2151,7 @@ class FitsThumbViewer(tk.Tk):
         )
         ttk.Button(btn_row, text="Quit", command=self._on_close).pack(side=tk.LEFT, padx=(4, 0))
         browse_actions = ttk.Frame(browse_col)
-        browse_actions.pack(anchor=tk.W, pady=(6, 0))
+        browse_actions.pack(anchor=tk.E, pady=(6, 0))
         self._stack_btn = ttk.Button(browse_actions, text="Stack", command=self._open_full_hill)
         self._stack_btn.pack(side=tk.LEFT)
         self._stars_btn = ttk.Button(browse_actions, text="Stars", command=self._open_stars)
@@ -2001,7 +2161,7 @@ class FitsThumbViewer(tk.Tk):
         self._clear_psf_btn = ttk.Button(browse_actions, text="Clear PSF", command=self._clear_psf)
         self._clear_psf_btn.pack(side=tk.LEFT, padx=(6, 0))
         psf_status_row = ttk.Frame(browse_col)
-        psf_status_row.pack(anchor=tk.W, pady=(4, 0))
+        psf_status_row.pack(anchor=tk.E, pady=(4, 0))
         self._psf_status_var = tk.StringVar(value="Stars PSF: per image")
         ttk.Label(psf_status_row, textvariable=self._psf_status_var).pack(side=tk.LEFT)
         self._sky_click_var = tk.StringVar(value="")
@@ -2009,14 +2169,19 @@ class FitsThumbViewer(tk.Tk):
             browse_col,
             textvariable=self._sky_click_var,
             font=("TkFixedFont",),
-        ).pack(anchor=tk.W, pady=(2, 0))
+        ).pack(anchor=tk.E, pady=(2, 0))
+
+        ttk.Label(top, text="Kernel:").grid(row=1, column=2, sticky="e", pady=(4, 0))
+        self._kernel_display_var = tk.StringVar(value=_spice_kernel_display_string())
+        self._kernel_entry = ttk.Entry(top, textvariable=self._kernel_display_var)
+        self._kernel_entry.grid(row=1, column=3, sticky="ew", padx=(6, 8), pady=(4, 0))
 
         hill_bar = ttk.Frame(self, padding=(8, 0, 8, 8))
         hill_bar.pack(fill=tk.X)
         hill_row0 = ttk.Frame(hill_bar)
         hill_row0.pack(fill=tk.X)
         ttk.Label(hill_row0, text="Hill sphere radius (km):").pack(side=tk.LEFT)
-        self._hill_km_var = tk.StringVar(value=str(DEFAULT_HILL_KM))
+        self._hill_km_var = tk.StringVar(value=str(default_hill_sphere_km()))
         ttk.Entry(hill_row0, textvariable=self._hill_km_var, width=12).pack(side=tk.LEFT, padx=(6, 0))
 
         sap_row = ttk.Frame(hill_bar)
@@ -2044,6 +2209,13 @@ class FitsThumbViewer(tk.Tk):
         ttk.Entry(hill_row1, textvariable=self._max_exp_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
         self._one_x_one_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(hill_row1, text="1x1 only", variable=self._one_x_one_var).pack(side=tk.LEFT, padx=(16, 0))
+        self._sci_01_only_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            hill_row1,
+            text="*01 only",
+            variable=self._sci_01_only_var,
+            command=self._load,
+        ).pack(side=tk.LEFT, padx=(12, 0))
         self._groups_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             hill_row1,
@@ -2051,6 +2223,9 @@ class FitsThumbViewer(tk.Tk):
             variable=self._groups_var,
             command=self._load,
         ).pack(side=tk.LEFT, padx=(12, 0))
+
+        self._browser_status = ttk.Label(self, text="", anchor=tk.W)
+        self._browser_status.pack(fill=tk.X, padx=8, pady=(0, 4))
 
         # Scrollable grid
         outer = ttk.Frame(self)
@@ -2117,20 +2292,54 @@ class FitsThumbViewer(tk.Tk):
             self._canvas.yview_scroll(3, "units")
         self.after_idle(self._sync_visible_rows)
 
+    def _refresh_kernel_display(self) -> None:
+        """Set kernel path(s) in the UI from the active encounter / ``get_spice_runtime``."""
+        self._kernel_display_var.set(_spice_kernel_display_string())
+
+    def _on_encounter_selected(self, _evt: tk.Event | None = None) -> None:
+        from satsearch_config import get_active_encounter, set_active_encounter_id
+
+        enc_id = self._encounter_var.get().strip()
+        self._browser_status.configure(text=f"Switching encounter to {enc_id!r} (SPICE reload)…")
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            try:
+                set_active_encounter_id(enc_id)
+            except ValueError:
+                return
+            enc = get_active_encounter()
+            if enc is None:
+                return
+            self._dir_var.set(thumb_dir_display(enc.default_fits_directory))
+            self._hill_km_var.set(str(enc.hill_sphere_km))
+            self._refresh_kernel_display()
+            self._browser_status.configure(
+                text=f"Loading FITS list for encounter {enc_id!r}…"
+            )
+            self.update_idletasks()
+            self._load()
+        finally:
+            self._browser_status.configure(text="")
+            self.config(cursor="")
+
     def _browse(self) -> None:
-        initial = self._dir_var.get().strip() or str(default_root_dir())
+        cur = self._dir_var.get().strip()
+        initial = str(thumb_dir_from_field(cur)) if cur else str(default_root_dir())
         p = filedialog.askdirectory(initialdir=initial, title="FITS directory")
         if p:
-            self._dir_var.set(p)
+            self._dir_var.set(thumb_dir_display(Path(p)))
 
     def _parse_hill_km(self) -> float:
+        from satsearch_config import default_hill_sphere_km
+
         try:
             v = float(self._hill_km_var.get().strip())
             if v > 0:
                 return v
         except (TypeError, ValueError):
             pass
-        return DEFAULT_HILL_KM
+        return default_hill_sphere_km()
 
     def _parse_min_exptime(self) -> float:
         try:
@@ -2228,7 +2437,7 @@ class FitsThumbViewer(tk.Tk):
                 "Select at least one FITS file (checkbox) to open the stack.",
             )
             return
-        root = Path(self._dir_var.get().strip())
+        root = thumb_dir_from_field(self._dir_var.get())
         if not root.is_dir():
             messagebox.showerror("Stack", "Browse to a valid FITS directory first.")
             return
@@ -2248,7 +2457,7 @@ class FitsThumbViewer(tk.Tk):
                 msg = "Select at least one FITS file (checkbox) to run Stars analysis."
             messagebox.showinfo("Stars", msg)
             return
-        root = Path(self._dir_var.get().strip())
+        root = thumb_dir_from_field(self._dir_var.get())
         if not root.is_dir():
             messagebox.showerror("Stars", "Browse to a valid FITS directory first.")
             return
@@ -2289,7 +2498,7 @@ class FitsThumbViewer(tk.Tk):
         if len(selected) != 1:
             messagebox.showinfo("Define PSF", "Select exactly one FITS file (checkbox).")
             return
-        root = Path(self._dir_var.get().strip())
+        root = thumb_dir_from_field(self._dir_var.get())
         if not root.is_dir():
             messagebox.showerror("Define PSF", "Browse to a valid FITS directory first.")
             return
@@ -2435,7 +2644,9 @@ class FitsThumbViewer(tk.Tk):
             ttk.Label(cell, text=display_fits_name(fp), wraplength=240, justify=tk.CENTER).pack()
             meta_lbl = ttk.Label(cell, text="", wraplength=260, justify=tk.LEFT)
             meta_lbl.pack()
-            future = self._executor.submit(load_thumb_job, fp, self._parse_hill_km())
+            future = self._executor.submit(
+                load_thumb_job, fp, self._parse_hill_km(), thumb_ca_ref_jd()
+            )
             self._pending.add(future)
             futs.append(future)
 
@@ -2481,7 +2692,53 @@ class FitsThumbViewer(tk.Tk):
         for r in range(first, last + 1):
             self._materialize_row(r)
 
+    def _apply_kernel_from_field(self) -> bool:
+        """Parse bare kernel file name(s) from the UI; if they differ from the loaded set, update SPICE."""
+        from satsearch_config import (
+            canonical_meta_kernels,
+            get_config,
+            get_spice_runtime,
+            resolve_meta_kernel_files,
+            set_meta_kernel_session_override,
+            validate_meta_kernel_basename,
+        )
+
+        raw = self._kernel_display_var.get().strip()
+        parts = [s.strip() for s in raw.split(";") if s.strip()]
+        if not parts:
+            messagebox.showerror(
+                "Kernel file names",
+                "Enter one or more NAIF meta-kernel .tm file names (bare names, no paths), separated by ';'.",
+                parent=self,
+            )
+            return False
+        basenames: list[str] = []
+        for s in parts:
+            try:
+                basenames.append(validate_meta_kernel_basename(s))
+            except ValueError as e:
+                messagebox.showerror("Kernel file names", str(e), parent=self)
+                return False
+        mk_dir = get_config().spice.meta_kernel_dir
+        try:
+            parsed = resolve_meta_kernel_files(mk_dir, tuple(basenames))
+        except FileNotFoundError as e:
+            messagebox.showerror("Kernel file names", str(e), parent=self)
+            return False
+
+        if parsed == canonical_meta_kernels():
+            set_meta_kernel_session_override(None)
+            return True
+
+        if parsed == get_spice_runtime().meta_kernels:
+            return True
+
+        set_meta_kernel_session_override(parsed)
+        return True
+
     def _load(self) -> None:
+        if not self._apply_kernel_from_field():
+            return
         try:
             self._load_body()
         finally:
@@ -2489,7 +2746,7 @@ class FitsThumbViewer(tk.Tk):
 
     def _load_body(self) -> None:
         self._clear_grid()
-        root = Path(self._dir_var.get().strip())
+        root = thumb_dir_from_field(self._dir_var.get())
         if not root.is_dir():
             box = ttk.Frame(self._canvas)
             ttk.Label(
@@ -2536,6 +2793,9 @@ class FitsThumbViewer(tk.Tk):
         one_x_one = self._one_x_one_var.get()
         if one_x_one:
             files = [p for p in files if is_1x1_binned_filename(p)]
+        sci_01_only = self._sci_01_only_var.get()
+        if sci_01_only:
+            files = [p for p in files if is_sci_exposure_01_filename(p)]
         if not files:
             box = ttk.Frame(self._canvas)
             parts: list[str] = []
@@ -2545,6 +2805,8 @@ class FitsThumbViewer(tk.Tk):
                 parts.append(f"EXPTIME ≤ {max_exp:g} s")
             if one_x_one:
                 parts.append("1×1 binning in filename")
+            if sci_01_only:
+                parts.append("*01 only (basename ends with _01.fit / _01.fits / _01.fts)")
             cond = " and ".join(parts) if parts else "the current filters"
             msg = f"No FITS files in:\n{root}\nmatching {cond}"
             ttk.Label(box, text=msg, justify=tk.CENTER).pack(pady=24)
@@ -2576,7 +2838,27 @@ class FitsThumbViewer(tk.Tk):
 
         groups_active = self._groups_var.get()
         if groups_active:
-            groups = compute_exposure_groups(files)
+            spin = [0]
+            syms = "|/-\\"
+
+            def on_group_prog(done: int, total: int) -> None:
+                spin[0] = (spin[0] + 1) % len(syms)
+                sym = syms[spin[0]]
+                try:
+                    self._browser_status.configure(
+                        text=f"Computing exposure groups {sym} ({done}/{total} FITS)…"
+                    )
+                    self.update_idletasks()
+                except tk.TclError:
+                    pass
+
+            try:
+                groups = compute_exposure_groups(files, progress=on_group_prog)
+            finally:
+                try:
+                    self._browser_status.configure(text="")
+                except tk.TclError:
+                    pass
             if not groups:
                 box = ttk.Frame(self._canvas)
                 ttk.Label(
@@ -2615,6 +2897,30 @@ class FitsThumbViewer(tk.Tk):
         self.after(150, self._sync_visible_rows)
 
 
+def _startup_progress_window() -> tk.Tk:
+    """Small window while encounters / SPICE / TCA bootstrap runs (destroy before main UI)."""
+    w = tk.Tk()
+    w.title("Satsearch — starting")
+    w.resizable(False, False)
+    text = (
+        "Loading encounters and SPICE kernels.\n\n"
+        "If closest-approach times are missing from encounters.toml, they are computed now "
+        "(roughly one minute per encounter). This window closes when startup finishes."
+    )
+    outer = ttk.Frame(w, padding=(28, 22))
+    outer.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(outer, text=text, wraplength=460, justify=tk.CENTER).pack()
+    w.update_idletasks()
+    ww, wh = w.winfo_reqwidth(), w.winfo_reqheight()
+    sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+    x = max(0, (sw - ww) // 2)
+    y = max(0, (sh - wh) // 3)
+    w.geometry(f"+{x}+{y}")
+    w.update_idletasks()
+    w.update()
+    return w
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FITS thumbnail viewer (Lucy LORRI).")
     parser.add_argument(
@@ -2635,9 +2941,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from satsearch_config import get_config
+    from satsearch_config import get_config, init_encounters_default
 
     get_config()  # Require valid ``satsearch.toml`` before any Tk setup.
+
+    splash: tk.Tk | None = None
+    try:
+        splash = _startup_progress_window()
+        init_encounters_default()
+    finally:
+        if splash is not None:
+            try:
+                splash.destroy()
+            except tk.TclError:
+                pass
 
     if args.stars:
         root = tk.Tk()

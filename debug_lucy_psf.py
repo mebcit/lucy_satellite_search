@@ -21,16 +21,10 @@ import numpy as np
 from matplotlib.patches import Circle
 from PIL import Image
 
-from fits_thumb_viewer import get_image_data_and_header, sky_scale
+from satsearch import get_image_data_and_header, sky_scale
 from fullhill import ensure_square_1024
 from lucy_getpsf import lucy_getpsf_debug
 
-_DEFAULT = (
-    Path(__file__).resolve().parent.parent
-    / "llori"
-    / "2025110"
-    / "lor_0798397126_04418_00001_1x1_sci_01.fit"
-)
 _PSF_UP = 300
 _CIRCLE_R_NATIVE = 8.0  # native pixels (same coord system as Photutils)
 
@@ -49,7 +43,14 @@ def _uniq_xy(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
 def main() -> None:
     args = [a for a in sys.argv[1:] if a != "--show"]
     do_show = "--show" in sys.argv[1:]
-    path = Path(args[0]).resolve() if args else _DEFAULT.resolve()
+    if not args:
+        print(
+            "Usage: debug_lucy_psf.py <file.fit> [--show]\n"
+            "Requires a FITS path argument (no default path; use satsearch.toml for app defaults).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    path = Path(args[0]).resolve()
     if not path.is_file():
         print(f"Not found: {path}", file=sys.stderr)
         sys.exit(1)

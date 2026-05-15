@@ -1,0 +1,29 @@
+# Per-target encounter presets (copy to ``encounters.toml`` next to ``satsearch_config.py``).
+# Each ``[[encounter]]`` block defines NAIF ``target_body``, bare meta-kernel **filenames**
+# (resolved under ``[spice].meta_kernel_dir`` in ``satsearch.toml``), default FITS folder name
+# (resolved under the parent of ``[paths].default_fits_directory`` in ``satsearch.toml``), and
+# default Hill sphere radius (km). Order is preserved; the first entry is the startup default.
+#
+# Required keys per encounter: ``id``, ``target_body``, ``meta_kernels``, ``default_fits_directory``,
+# ``hill_sphere_km``. ``meta_kernels`` must be bare file names (no ``/`` or ``\``).
+# ``default_fits_directory`` must be a single directory name (e.g. ``2025110``), not a full path.
+# Optional: ``closest_approach_utc`` (ISO UTC). If omitted, it is computed once from SPICE on first
+# load and written into this file (see README).
+
+[[encounter]]
+id = "DJ"
+target_body = "DONALDJOHANSON"
+default_fits_directory = "2025110"
+meta_kernels = [
+    "lcy.donj.science.LATEST.tm",
+]
+hill_sphere_km = 711.0
+
+[[encounter]]
+id = "Dinky"
+target_body = "DINKINESH"
+default_fits_directory = "2023305"
+meta_kernels = [
+    "lcy.dnky.dl.v12.tm",
+]
+hill_sphere_km = 120.0

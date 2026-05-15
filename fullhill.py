@@ -12,6 +12,7 @@ Python port of fullhill.pro (no fullhillshifts.dat).
 
 from __future__ import annotations
 
+import concurrent.futures
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Literal
 import numpy as np
 from scipy import ndimage as ndi
 
-from fits_thumb_viewer import (
+from satsearch import (
     CA_REF_JD,
     arcsec_per_pixel_from_filename,
     get_image_data_and_header,
@@ -39,10 +40,24 @@ MASS_KG = VOLUME_KM3 * 1.2 / 1000.0 * 1.0e15
 G1 = 0.63
 G2 = 0.18
 AU_KM = 1.496e8
+DEFAULT_STACK_WORKERS = 40
 
 
 def _package_dir() -> Path:
     return Path(__file__).resolve().parent
+
+
+def _stack_worker_count(n: int, max_workers: int | None) -> int:
+    """Worker count for per-plane Stack work; default cap is 40."""
+    if n <= 1:
+        return 1
+    if max_workers is None:
+        max_workers = DEFAULT_STACK_WORKERS
+    try:
+        limit = int(max_workers)
+    except (TypeError, ValueError):
+        limit = DEFAULT_STACK_WORKERS
+    return max(1, min(n, limit))
 
 
 def _load_g1g2_table() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -404,7 +419,7 @@ class FullHillPrep:
     imb: np.ndarray
     psf: list[np.ndarray]
     #: Per-plane primary ``EXPTIME`` from each **main** FITS (seconds), via
-    #: :func:`fits_thumb_viewer.primary_exptime_seconds`. Used for ``fakesat_flux * exptime``;
+    #: :func:`satsearch.primary_exptime_seconds`. Used for ``fakesat_flux * exptime``;
     #: not the short mate's ``EXPTIME``, and not :attr:`exposure_scale` (``et_m / et_short``).
     et_m: np.ndarray
     rr: np.ndarray
@@ -428,6 +443,21 @@ def _resolve_short_path(
 ) -> tuple[int, Path]:
     key = main_path.resolve()
     idx_map = {p.resolve(): i for i, p in enumerate(all_sorted)}
+    if key not in idx_map:
+        raise ValueError(f"{main_path.name} not found in directory listing")
+    idx = idx_map[key]
+    if idx < 2:
+        raise ValueError(
+            f"Need at least two earlier files in the folder for short mate (index {idx} < 2): {main_path.name}"
+        )
+    return idx, all_sorted[idx - 2]
+
+
+def _resolve_short_path_from_index(
+    main_path: Path, all_sorted: list[Path], idx_map: dict[Path, int]
+) -> tuple[int, Path]:
+    """Same rule as :func:`_resolve_short_path`, using a precomputed index map."""
+    key = main_path.resolve()
     if key not in idx_map:
         raise ValueError(f"{main_path.name} not found in directory listing")
     idx = idx_map[key]
@@ -463,23 +493,115 @@ def _dj_flux_denominators(dj: np.ndarray) -> np.ndarray:
 def run_fullhill_prepare(
     main_paths: list[Path],
     all_sorted: list[Path],
+    *,
+    ca_ref_jd: float | None = None,
+    max_workers: int | None = None,
 ) -> FullHillPrep:
     """
     Load FITS, align, sky-subtract mains, ``lucy_getpsf`` per plane, and photometry scalars.
 
     Call once per selection; reuse with :func:`run_fullhill_from_prep` when only satellite
     parameters change.
+
+    ``ca_ref_jd`` is the Julian date of closest approach for ``hours_ca`` (Δt from CA in hours).
+    When ``None``, uses :data:`satsearch.CA_REF_JD` (legacy DJ reference). The thumbnail viewer passes
+    the active encounter's ``closest_approach_utc`` from ``encounters.toml`` via :func:`satsearch.thumb_ca_ref_jd`.
+    ``max_workers`` caps per-image thread parallelism (default: 40).
     """
+    ref = float(CA_REF_JD if ca_ref_jd is None else ca_ref_jd)
     n = len(main_paths)
     if n == 0:
         raise ValueError("No main FITS files selected.")
 
-    imb = np.zeros((1024, 1024, n), dtype=np.float64)
+    workers = _stack_worker_count(n, max_workers)
+    idx_map = {p.resolve(): i for i, p in enumerate(all_sorted)}
+
+    def run_many(fn, items):
+        if workers <= 1:
+            for x in items:
+                yield fn(x)
+            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            pending = {ex.submit(fn, x) for x in items}
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for fut in done:
+                    yield fut.result()
+
+    def load_short_plane(item: tuple[int, Path]) -> tuple[int, Path, float, np.ndarray, float]:
+        i, main_p = item
+        _, short_p = _resolve_short_path_from_index(main_p, all_sorted, idx_map)
+        et_s = primary_exptime_seconds(short_p)
+        et_m_val = primary_exptime_seconds(main_p)
+        if et_s is None or et_s <= 0 or et_m_val is None or et_m_val <= 0:
+            raise ValueError(
+                f"Need EXPTIME on both mates: {short_p.name} ({et_s}), {main_p.name} ({et_m_val})"
+            )
+        data_s, _ = get_image_data_and_header(short_p)
+        scale = float(et_m_val / et_s)
+        ds = ensure_square_1024(np.asarray(data_s, dtype=np.float64) * scale)
+        return i, short_p, scale, sky_subtract_median(ds)[0], float(et_m_val)
+
+    items = list(enumerate(main_paths))
+    short_paths: list[Path] = [Path()] * n
+    exposure_scale: list[float] = [1.0] * n
+    ims_raw: list[np.ndarray] = [np.empty((0, 0), dtype=np.float64) for _ in range(n)]
+    et_m = np.zeros(n, dtype=np.float64)
+    for i, short_p, scale, im_raw, et_m_val in run_many(load_short_plane, items):
+        short_paths[i] = short_p
+        exposure_scale[i] = scale
+        ims_raw[i] = im_raw
+        et_m[i] = et_m_val
+
+    def centroid_plane(item: tuple[int, np.ndarray]) -> tuple[int, float, float]:
+        i, im = item
+        cxi, cyi = centroid_bright_near_center(im)
+        return i, float(cxi), float(cyi)
+
+    centroids: list[tuple[float, float]] = [(0.0, 0.0)] * n
+    for i, cxi, cyi in run_many(centroid_plane, list(enumerate(ims_raw))):
+        centroids[i] = (cxi, cyi)
+
     xs = np.zeros(n, dtype=np.float64)
     ys = np.zeros(n, dtype=np.float64)
-    short_paths: list[Path] = []
-    exposure_scale: list[float] = []
+    cx0, cy0 = centroids[0]
+    djx, djy = float(cx0), float(cy0)
+    for i, (cxi, cyi) in enumerate(centroids):
+        xs[i] = 0.0 if i == 0 else cxi - cx0
+        ys[i] = 0.0 if i == 0 else cyi - cy0
 
+    def align_short_plane(i: int) -> tuple[int, np.ndarray]:
+        if i == 0:
+            return i, ims_raw[0].copy()
+        return i, xyshift_cubic(ims_raw[i], -ys[i], -xs[i])
+
+    ims_aligned: list[np.ndarray] = [np.empty((0, 0), dtype=np.float64) for _ in range(n)]
+    for i, im in run_many(align_short_plane, list(range(n))):
+        ims_aligned[i] = im
+
+    def process_main_plane(
+        item: tuple[int, Path],
+    ) -> tuple[int, np.ndarray, np.ndarray, float, float, float, float, float, float, float]:
+        i, main_p = item
+        data_m, _hdr_m = get_image_data_and_header(main_p)
+        im = ensure_square_1024(np.asarray(data_m, dtype=np.float64))
+        if i > 0:
+            im = xyshift_cubic(im, -ys[i], -xs[i])
+        raw_for_psf = im.copy()
+        sk, _ = sky_subtract_median(im)
+        rr_i, ph_i, delta_i = geometry_from_spice(main_p)
+        asp = arcsec_per_pixel_from_filename(main_p)
+        kpp_i = asp / 3600.0 * (math.pi / 180.0) * rr_i
+        jd_i = jd_from_path(main_p)
+        hours_i = (jd_i - ref) * 24.0
+        dj_i = float(np.sum(ims_aligned[i][430:538, 479:618]))
+        psf_i = lucy_getpsf(raw_for_psf)
+        return i, sk, psf_i, rr_i, ph_i, delta_i, kpp_i, jd_i, hours_i, dj_i
+
+    imb = np.zeros((1024, 1024, n), dtype=np.float64)
+    psf: list[np.ndarray] = [np.empty((0, 0), dtype=np.float64) for _ in range(n)]
     rr = np.zeros(n, dtype=np.float64)
     ph_deg = np.zeros(n, dtype=np.float64)
     delta_km = np.zeros(n, dtype=np.float64)
@@ -488,67 +610,20 @@ def run_fullhill_prepare(
     jd_arr = np.zeros(n, dtype=np.float64)
     hours_ca = np.zeros(n, dtype=np.float64)
 
-    ims_raw: list[np.ndarray] = []
-    for i, main_p in enumerate(main_paths):
-        _, short_p = _resolve_short_path(main_p, all_sorted)
-        short_paths.append(short_p)
-        data_s, _ = get_image_data_and_header(short_p)
-        data_m, _ = get_image_data_and_header(main_p)
-        et_s = primary_exptime_seconds(short_p)
-        et_m = primary_exptime_seconds(main_p)
-        if et_s is None or et_s <= 0 or et_m is None or et_m <= 0:
-            raise ValueError(
-                f"Need EXPTIME on both mates: {short_p.name} ({et_s}), {main_p.name} ({et_m})"
-            )
-        scale = float(et_m / et_s)
-        exposure_scale.append(scale)
-        ds = ensure_square_1024(np.asarray(data_s, dtype=np.float64) * scale)
-        ims_raw.append(sky_subtract_median(ds)[0])
-
-    cx0: float | None = None
-    cy0: float | None = None
-    ims_aligned = []
-    for i in range(n):
-        cxi, cyi = centroid_bright_near_center(ims_raw[i])
-        if i == 0:
-            cx0, cy0 = float(cxi), float(cyi)
-            djx, djy = cx0, cy0
-            xs[i] = 0.0
-            ys[i] = 0.0
-            ims_aligned.append(ims_raw[0].copy())
-        else:
-            assert cx0 is not None and cy0 is not None
-            xs[i] = cxi - cx0
-            ys[i] = cyi - cy0
-            ims_aligned.append(xyshift_cubic(ims_raw[i], -ys[i], -xs[i]))
-
-    raw_shifted: list[np.ndarray] = []
-    for i, main_p in enumerate(main_paths):
-        data_m, _hdr_m = get_image_data_and_header(main_p)
-        im = ensure_square_1024(np.asarray(data_m, dtype=np.float64))
-        if i > 0:
-            im = xyshift_cubic(im, -ys[i], -xs[i])
-        raw_shifted.append(im.copy())
-        sk, _ = sky_subtract_median(im)
+    for i, sk, psf_i, rr_i, ph_i, delta_i, kpp_i, jd_i, hours_i, dj_i in run_many(
+        process_main_plane, items
+    ):
         imb[:, :, i] = sk
-
-        rr[i], ph_deg[i], delta_km[i] = geometry_from_spice(main_p)
-        asp = arcsec_per_pixel_from_filename(main_p)
-        kpp[i] = asp / 3600.0 * (math.pi / 180.0) * rr[i]
-
-        jd_arr[i] = jd_from_path(main_p)
-        hours_ca[i] = (jd_arr[i] - CA_REF_JD) * 24.0
-
-        dj[i] = float(np.sum(ims_aligned[i][430:538, 479:618]))
+        psf[i] = psf_i
+        rr[i] = rr_i
+        ph_deg[i] = ph_i
+        delta_km[i] = delta_i
+        kpp[i] = kpp_i
+        jd_arr[i] = jd_i
+        hours_ca[i] = hours_i
+        dj[i] = dj_i
 
     dj_den = _dj_flux_denominators(dj)
-
-    psf: list[np.ndarray] = []
-    et_m = np.zeros(n, dtype=np.float64)
-    for i, main_p in enumerate(main_paths):
-        psf.append(lucy_getpsf(raw_shifted[i]))
-        et = primary_exptime_seconds(main_p)
-        et_m[i] = float(et) if et is not None else 1.0
 
     return FullHillPrep(
         imb=imb,
@@ -577,25 +652,40 @@ def run_fullhill_from_prep(
     albedo: float,
     satdist_km: float,
     satang_deg: float,
+    *,
+    max_workers: int | None = None,
 ) -> FullHillResult:
     """Build fake satellite on a **copy** of ``prep.imb`` (prep stays pristine for re-run)."""
     imb0 = prep.imb
     n = int(imb0.shape[2])
+    workers = _stack_worker_count(n, max_workers)
     dj_den = prep.dj_den
     djx = prep.djx
     djy = prep.djy
     rr = prep.rr
     jd_arr = prep.jd_arr
 
+    def run_many(fn, items):
+        if workers <= 1:
+            for x in items:
+                yield fn(x)
+            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            pending = {ex.submit(fn, x) for x in items}
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for fut in done:
+                    yield fut.result()
+
     # Sky-subtracted mains + fake satellite (never mutate ``prep.imb``).
-    imb_sat = imb0.copy()
-    imsat = imb0.copy()
     satang_rad = math.radians(satang_deg)
     om = omega_rad_per_s(satdist_km)
 
-    for i in range(n):
+    def inject_fake_plane(i: int) -> tuple[int, np.ndarray]:
         if diam_m <= 0.0:
-            plane = imb0[:, :, i]
+            return i, np.asarray(imb0[:, :, i], dtype=np.float64)
         else:
             dt_sec = (jd_arr[i] - jd_arr[0]) * 86400.0
 
@@ -618,26 +708,25 @@ def run_fullhill_from_prep(
                 (djx - 512.5 + sx_pix),
             )
             plane = imb0[:, :, i] + shifted
+            return i, plane
+
+    imb_sat = np.empty_like(imb0)
+    for i, plane in run_many(inject_fake_plane, list(range(n))):
         imb_sat[:, :, i] = plane
-        imsat[:, :, i] = plane
+    imsat = imb_sat.copy()
 
     imbs = imb_sat.copy()
-    for i in range(n):
-        imbs[:, :, i] /= dj_den[i]
+    imbs /= dj_den.reshape(1, 1, n)
 
     psf_med = np.median(imbs, axis=2)
-    for i in range(n):
-        imbs[:, :, i] -= psf_med
-    for i in range(n):
-        imbs[:, :, i] *= dj_den[i]
+    imbs -= psf_med[:, :, np.newaxis]
+    imbs *= dj_den.reshape(1, 1, n)
     # Same normalization / median PSF as ``imbs`` (input was identical ``imb_sat``).
     imsats = imbs.copy()
 
-    imz = np.array(imsat, copy=True)
-    imzs = np.array(imsats, copy=True)
-
     rr_last = float(rr[-1])
-    for i in range(n):
+
+    def zoom_plane(i: int) -> tuple[int, np.ndarray, np.ndarray]:
         if rr_last <= 0:
             sz = 1024
         else:
@@ -647,11 +736,18 @@ def run_fullhill_from_prep(
         sy_c = 511.5 - djy
         a = xyshift_cubic(imsat[:, :, i], sy_c, sx_c)
         a = a / dj_den[i] * dj_den[0]
-        imz[:, :, i] = congrid_zoom_center(a, sz, 1024)
+        imz_i = congrid_zoom_center(a, sz, 1024)
 
         b = xyshift_cubic(imsats[:, :, i], sy_c, sx_c)
         b = b / dj_den[i] * dj_den[0]
-        imzs[:, :, i] = congrid_zoom_center(b, sz, 1024)
+        imzs_i = congrid_zoom_center(b, sz, 1024)
+        return i, imz_i, imzs_i
+
+    imz = np.empty_like(imsat)
+    imzs = np.empty_like(imsats)
+    for i, imz_i, imzs_i in run_many(zoom_plane, list(range(n))):
+        imz[:, :, i] = imz_i
+        imzs[:, :, i] = imzs_i
 
     median_imz = np.median(imz, axis=2)
     median_imzs = np.median(imzs, axis=2)
@@ -679,6 +775,9 @@ def run_fullhill(
     albedo: float,
     satdist_km: float,
     satang_deg: float,
+    *,
+    ca_ref_jd: float | None = None,
+    max_workers: int | None = None,
 ) -> FullHillResult:
     """
     Full pipeline: prepare then satellite-dependent stacks.
@@ -686,5 +785,9 @@ def run_fullhill(
     For interactive satellite tuning, call :func:`run_fullhill_prepare` once and then
     :func:`run_fullhill_from_prep` repeatedly.
     """
-    prep = run_fullhill_prepare(main_paths, all_sorted)
-    return run_fullhill_from_prep(prep, diam_m, albedo, satdist_km, satang_deg)
+    prep = run_fullhill_prepare(
+        main_paths, all_sorted, ca_ref_jd=ca_ref_jd, max_workers=max_workers
+    )
+    return run_fullhill_from_prep(
+        prep, diam_m, albedo, satdist_km, satang_deg, max_workers=max_workers
+    )
